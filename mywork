@@ -1,0 +1,65 @@
+# MCP Atlassian Docker Sample (Jira Server/DC)
+
+This repository provides a ready-to-use Docker configuration for deploying the [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian) integration with Atlassian Jira Server or Data Center.
+
+## Prerequisites
+
+- Docker installed on your machine
+- Jira Server or Data Center instance (version 8.14+)
+- A Personal Access Token (PAT) for your Jira instance
+
+## Usage
+
+1. **Create a `.env` file** in your project folder with the following content:
+
+    ```env
+    JIRA_URL=https://jira.your-company.com
+    JIRA_PERSONAL_TOKEN=your_personal_token
+    ```
+
+    Replace the values with your Jira Server/DC URL and personal token.
+
+2. **Run the Docker container:**
+
+    ```bash
+    docker run --rm -p 9000:9000 --env-file .env ghcr.io/sooperset/mcp-atlassian:latest --transport sse --port 9000 -vv
+    ```
+
+    - The server will be available at `http://localhost:9000/sse`
+    - If you prefer the streamable-http transport, use `--transport streamable-http` and connect to `/mcp`.
+
+## Example Configuration (JSON)
+
+If you want to connect this to an IDE or automation, here’s a sample configuration block:
+
+```json
+{
+  "mcpServers": {
+    "mcp-atlassian": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-e", "JIRA_URL",
+        "-e", "JIRA_PERSONAL_TOKEN",
+        "ghcr.io/sooperset/mcp-atlassian:latest"
+      ],
+      "env": {
+        "JIRA_URL": "https://jira.your-company.com",
+        "JIRA_PERSONAL_TOKEN": "your_personal_token"
+      }
+    }
+  }
+}
+```
+
+## References
+
+- [sooperset/mcp-atlassian GitHub](https://github.com/sooperset/mcp-atlassian)
+- [Docker Hub: ghcr.io/sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian/pkgs/container/mcp-atlassian)
+
+---
+
+**Note:**  
+Keep your `.env` file secure and never commit it to version control.
