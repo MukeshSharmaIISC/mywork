@@ -220,7 +220,7 @@ public class DebugDataCollector {
                         MutableSnapshotItem rootExceptionItem = new MutableSnapshotItem(name, type[0], descriptor.getValue() != null ? descriptor.getValue().toString() : "null", "Exception");
                         AtomicInteger pending = new AtomicInteger(1);
                         collectSnapshotRecursive(value, rootExceptionItem, () -> {
-                            instance.latestException = new ExceptionDetail(rootExceptionItem, filePath);
+                            instance.latestException = new ExceptionDetail(rootExceptionItem.toSnapshotItem(), filePath);
                             callback.accept(new ContextItem(instance.latestException, true, ContextItem.Type.EXCEPTION));
                         });
                         break; // Only first matching exception
@@ -261,5 +261,27 @@ public class DebugDataCollector {
             PsiElement functionElement = PsiTreeUtil.getParentOfType(elementAt, PsiMethod.class, PsiLambdaExpression.class);
             return functionElement != null ? functionElement.getText() : null;
         });
+    }
+
+    // === Exception message and stack trace helpers ===
+    public String getExceptionMessage() {
+        ExceptionDetail ex = getExceptionDetail();
+        return ex != null ? findChildValue(ex.getExceptionSnapshot(), "message", "detailMessage") : null;
+    }
+
+    public String getExceptionStackTrace() {
+        ExceptionDetail ex = getExceptionDetail();
+        return ex != null ? findChildValue(ex.getExceptionSnapshot(), "stackTrace") : null;
+    }
+
+    private String findChildValue(SnapshotItem item, String... possibleNames) {
+        for (String name : possibleNames) {
+            if (item.getName().equals(name)) return item.getValue();
+        }
+        for (SnapshotItem child : item.getChildren()) {
+            String result = findChildValue(child, possibleNames);
+            if (result != null) return result;
+        }
+        return null;
     }
 }
