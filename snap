@@ -1,0 +1,43 @@
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class SnapshotItem {
+    private final String name;
+    private final String type;
+    private final String value;
+    private final String scope;
+    private final List<SnapshotItem> children;
+
+    public SnapshotItem(String name, String type, String value, String scope) {
+        this(name, type, value, scope, Collections.emptyList());
+    }
+
+    public SnapshotItem(String name, String type, String value, String scope, List<SnapshotItem> children) {
+        this.name = name;
+        this.type = type;
+        this.value = value;
+        this.scope = scope;
+        this.children = children == null ? Collections.emptyList() : Collections.unmodifiableList(new ArrayList<>(children));
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    public String getValue() {
+        return value;
+    }
+
+    public String getScope() {
+        return scope;
+    }
+
+    public List<SnapshotItem> getChildren() {
+        return children;
+    }
+}
