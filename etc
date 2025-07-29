@@ -1,10 +1,8 @@
-// ... (imports and previous class content unchanged)
+// ... imports and class definition as before
 
-    // ================== Recursive Snapshot Collection ====================
     public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
         List<MutableSnapshotItem> snapshotItems = new ArrayList<>();
         XSourcePosition sourcePosition = currentStackFrame.getSourcePosition();
-        String ext = sourcePosition != null ? sourcePosition.getFile().getExtension() : null;
         AtomicInteger pending = new AtomicInteger(1);
 
         Consumer<Void> completion = (v) -> {
@@ -50,7 +48,6 @@
         });
     }
 
-    /** Recursively collect children for a variable. */
     private static void collectSnapshotRecursive(XValue value, MutableSnapshotItem parent, Runnable onFinish) {
         value.computePresentation(new XValueNode() {
             @Override
@@ -120,4 +117,4 @@
         }, XValuePlace.TREE);
     }
 
-// ... (rest of the file unchanged)
+// ... rest of the file unchanged
