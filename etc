@@ -1,120 +1,197 @@
-// ... imports and class definition as before
+package org.samsung.aipp.aippintellij.debugAssist;
 
-    public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
-        List<MutableSnapshotItem> snapshotItems = new ArrayList<>();
-        XSourcePosition sourcePosition = currentStackFrame.getSourcePosition();
-        AtomicInteger pending = new AtomicInteger(1);
+import com.intellij.debugger.ui.breakpoints.JavaExceptionBreakpointType;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ProjectManager;
+import com.intellij.openapi.startup.StartupActivity;
+import com.intellij.xdebugger.*;
+import com.intellij.xdebugger.breakpoints.XBreakpoint;
+import com.intellij.xdebugger.frame.*;
+import org.jetbrains.annotations.NotNull;
 
-        Consumer<Void> completion = (v) -> {
-            List<SnapshotItem> result = new ArrayList<>();
-            for (MutableSnapshotItem item : snapshotItems) result.add(item.toSnapshotItem());
-            instance.latestSnapshot.clear();
-            instance.latestSnapshot.addAll(result);
-            System.out.println("[DebugDataCollector] Snapshot collection complete. Items collected: " + result.size());
-            callback.accept(new ContextItem(result, true, ContextItem.Type.SNAPSHOT));
-        };
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-        currentStackFrame.computeChildren(new XCompositeNode() {
+public class DebugAttacher implements StartupActivity {
+    private static final Logger logger = Logger.getInstance(DebugAttacher.class);
+
+    @Override
+    public void runActivity(@NotNull Project project) {
+        System.out.println("Activity Started");
+        attachDebugStartListener(project);
+    }
+
+    public void sessionStopped() {
+        System.out.println("[DEBUG] Debug session stopped - cleaning up");
+        // Clear debug data when session ends
+        DebugDataCollector.getInstance().clearDebugData();
+        System.out.println("[DEBUG] Debug data cleared");
+        // Notify UI to update menu states
+        // Removed .processStopped(null) to avoid NullPointerException in listeners!
+        // ProjectManager.getInstance().getDefaultProject().getMessageBus()
+        //         .syncPublisher(XDebuggerManager.TOPIC)
+        //         .processStopped(null);
+        System.out.println("[DEBUG] UI notified of session stop");
+    }
+
+    private void attachDebugStartListener(Project project) {
+        project.getMessageBus().connect().subscribe(XDebuggerManager.TOPIC, new XDebuggerManagerListener() {
             @Override
-            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                if (children.size() == 0) {
-                    System.out.println("[DebugDataCollector] No children found in stack frame.");
-                    completion.accept(null);
-                    return;
-                }
-                pending.addAndGet(children.size());
-                for (int i = 0; i < children.size(); i++) {
-                    String varName = children.getName(i);
-                    XValue childValue = children.getValue(i);
-                    MutableSnapshotItem mutableItem = new MutableSnapshotItem(varName, "unknown", "unavailable", "Local");
-                    snapshotItems.add(mutableItem);
-                    System.out.println("[DebugDataCollector] Collecting variable: " + varName);
-                    collectSnapshotRecursive(childValue, mutableItem, () -> {
-                        System.out.println("[DebugDataCollector] Collected: " + mutableItem.name + " | Value: " + mutableItem.value + " | Type: " + mutableItem.type);
-                        if (pending.decrementAndGet() == 0) completion.accept(null);
-                    });
-                }
-                if (pending.decrementAndGet() == 0) completion.accept(null);
+            public void processStarted(@NotNull XDebugProcess debugProcess) {
+                System.out.println("Debug session started");
+                enableExceptionBreakpoints(project);
+                attachDebugBreakListener(debugProcess);
             }
-            @Override public void tooManyChildren(int remaining) {}
-            @Override public void setAlreadySorted(boolean alreadySorted) {}
-            @Override public void setErrorMessage(@NotNull String errorMessage) {
-                System.out.println("[DebugDataCollector] Error during snapshot collection: " + errorMessage);
-            }
-            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {
-                System.out.println("[DebugDataCollector] Error during snapshot collection: " + s);
-            }
-            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
         });
     }
 
-    private static void collectSnapshotRecursive(XValue value, MutableSnapshotItem parent, Runnable onFinish) {
-        value.computePresentation(new XValueNode() {
-            @Override
-            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                try {
-                    if (presentation.getType() != null) parent.type = presentation.getType();
-                    StringBuilder sb = new StringBuilder();
-                    presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
-                        @Override public void renderValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderStringValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderNumericValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderKeywordValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) { sb.append(value); }
-                        @Override public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) { sb.append(value); }
-                        @Override public void renderComment(@NotNull String comment) {}
-                        @Override public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
-                        @Override public void renderError(@NotNull String error) { sb.append(error); }
-                    });
-                    parent.value = sb.toString();
-                    System.out.println("[DebugDataCollector] Presentation OK for: " + parent.name + " | Value: " + parent.value + " | Type: " + parent.type);
-                } catch (Exception e) {
-                    parent.value = "Value not available";
-                    System.out.println("[DebugDataCollector] Error computing value for " + parent.name + ": " + e.getMessage());
-                    if (e.getMessage() != null && e.getMessage().contains("not yet calculated")) {
-                        parent.value = "Calculating...";
-                        System.out.println("[DebugDataCollector] Value for " + parent.name + " is still calculating.");
-                    }
-                }
-                if (hasChildren) {
-                    value.computeChildren(new XCompositeNode() {
-                        @Override
-                        public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                            if (children.size() == 0) {
-                                System.out.println("[DebugDataCollector] No children for object: " + parent.name);
-                                onFinish.run();
-                                return;
-                            }
-                            AtomicInteger childPending = new AtomicInteger(children.size());
-                            for (int i = 0; i < children.size(); i++) {
-                                String childName = children.getName(i);
-                                XValue childVal = children.getValue(i);
-                                MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
-                                parent.children.add(childItem);
-                                System.out.println("[DebugDataCollector] Recursively collecting for child: " + childName + " of parent: " + parent.name);
-                                collectSnapshotRecursive(childVal, childItem, () -> {
-                                    System.out.println("[DebugDataCollector] Collected child: " + childItem.name + " | Value: " + childItem.value + " | Type: " + childItem.type);
-                                    if (childPending.decrementAndGet() == 0) onFinish.run();
-                                });
-                            }
-                        }
-                        @Override public void tooManyChildren(int remaining) {}
-                        @Override public void setAlreadySorted(boolean alreadySorted) {}
-                        @Override public void setErrorMessage(@NotNull String errorMessage) {
-                            System.out.println("[DebugDataCollector] Error during children collection: " + errorMessage);
-                        }
-                        @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {
-                            System.out.println("[DebugDataCollector] Error during children collection: " + s);
-                        }
-                        @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
-                    });
-                } else {
-                    onFinish.run();
-                }
-            }
-            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-            @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
-        }, XValuePlace.TREE);
+    private void enableExceptionBreakpoints(Project project) {
+        var breakpoints = XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints();
+        for (XBreakpoint<?> bp : breakpoints)
+            if (bp.getType() instanceof JavaExceptionBreakpointType) bp.setEnabled(true);
     }
 
-// ... rest of the file unchanged
+    private void attachDebugBreakListener(@NotNull XDebugProcess debugProcess) {
+        debugProcess.getSession().addSessionListener(new XDebugSessionListener() {
+            @Override
+            public void sessionPaused() {
+                handleDebugEvent(debugProcess);
+            }
+
+            @Override
+            public void stackFrameChanged() {
+                handleDebugEvent(debugProcess);
+            }
+
+            @Override
+            public void sessionStopped() {
+                DebugAttacher.this.sessionStopped();
+            }
+        });
+    }
+    private void handleDebugEvent(@NotNull XDebugProcess debugProcess) {
+        XStackFrame currentFrame = debugProcess.getSession().getCurrentStackFrame();
+        if (currentFrame == null) return;
+
+        // Add delay to allow values to be calculated
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            try {
+                // First attempt with small delay
+                Thread.sleep(100);
+                DebugDataCollector.collectStackItems(debugProcess, stack -> {});
+
+                // Retry mechanism for snapshot
+                int retries = 3;
+                while (retries-- > 0) {
+                    try {
+                        DebugDataCollector.collectSnapshot(currentFrame, snapshot -> {});
+                        break;
+                    } catch (Exception e) {
+                        if (retries > 0) {
+                            Thread.sleep(200); // Wait longer between retries
+                        } else {
+                            logger.warn("Failed to collect snapshot after retries: " + e.getMessage());
+                        }
+                    }
+                }
+
+                DebugDataCollector.collectException(currentFrame, exception -> {
+                    if (exception.hasData()) { /*TODO: Handle Exception Data here.*/}
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("Debug data collection interrupted", e);
+            } catch (Exception e) {
+                logger.error("Error during debug data collection", e);
+            }
+        });
+    }
+
+    public static boolean isPaused(Project project) {
+        try {
+            // First try the provided project
+            XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
+            if (session != null) {
+                System.out.println("[DEBUG] Found session in provided project: " + project.getName());
+                return session.isPaused();
+            }
+
+            // If no session found, check all open projects
+            for (Project openProject : ProjectManager.getInstance().getOpenProjects()) {
+                if (openProject.equals(project)) continue; // Skip the original project
+
+                session = XDebuggerManager.getInstance(openProject).getCurrentSession();
+                if (session != null) {
+                    System.out.println("[DEBUG] Found session in project: " + openProject.getName());
+                    return session.isPaused();
+                }
+            }
+
+            System.out.println("[DEBUG] No active debug session found in any project");
+            return false;
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Error checking debug sessions: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public static Map<String, Boolean> getDefaultDebugItems() {
+        Map<String, Boolean> defaultItems = new HashMap<>();
+        defaultItems.put("callstack", false);
+        defaultItems.put("snapshot", false);
+        defaultItems.put("exception", false);
+        return defaultItems;
+    }
+
+    public static String getDebugInfoFor(String command) {
+//        System.out.println("Fetching debug info for command: " + command);
+        switch (command) {
+            case "snapshot":
+                List<SnapshotItem> snapshotItems = DebugDataCollector.getInstance().getSnapshot();
+                if (snapshotItems == null || snapshotItems.isEmpty()) {
+                    System.out.println("Snapshot is null or empty");
+                    return null;
+                }
+                StringBuilder snapshotBuilder = new StringBuilder();
+                for (SnapshotItem item : snapshotItems) {
+                    snapshotBuilder.append(item.getName()).append(": ").append(item.getValue()).append("\n");
+                }
+                String snapshotResult = snapshotBuilder.toString().trim();
+                System.out.println("Snapshot result:\n" + snapshotResult);
+                return snapshotResult;
+
+            case "callstack":
+                List<StackItem> stackItems = DebugDataCollector.getInstance().getCallStack();
+                if (stackItems == null || stackItems.isEmpty()) {
+                    System.out.println("Call stack is null or empty");
+                    return null;
+                }
+                StringBuilder stackBuilder = new StringBuilder();
+                for (StackItem item : stackItems) {
+                    stackBuilder.append(item.getFunction())
+                            .append(" at ").append(item.getFilePath()).append(":").append(item.getLine()).append("\n");
+                }
+                String stackResult = stackBuilder.toString().trim();
+                System.out.println("Stack result:\n" + stackResult);
+                return stackResult;
+
+            case "exception":
+                String message = DebugDataCollector.getInstance().getExceptionMessage();
+                String stackTrace = DebugDataCollector.getInstance().getExceptionStackTrace();
+                if (message == null && stackTrace == null) {
+                    System.out.println("Exception detail is null or empty");
+                    return null;
+                }
+                String exceptionResult = ((message != null ? message : "") + "\n" + (stackTrace != null ? stackTrace : "")).trim();
+                System.out.println("Exception result:\n" + exceptionResult);
+                return exceptionResult;
+
+            default:
+                System.out.println("Unknown debug command: " + command);
+                return null;
+        }
+    }
+
+}
