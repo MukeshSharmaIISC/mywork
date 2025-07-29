@@ -1,0 +1,123 @@
+// ... (imports and previous class content unchanged)
+
+    // ================== Recursive Snapshot Collection ====================
+    public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
+        List<MutableSnapshotItem> snapshotItems = new ArrayList<>();
+        XSourcePosition sourcePosition = currentStackFrame.getSourcePosition();
+        String ext = sourcePosition != null ? sourcePosition.getFile().getExtension() : null;
+        AtomicInteger pending = new AtomicInteger(1);
+
+        Consumer<Void> completion = (v) -> {
+            List<SnapshotItem> result = new ArrayList<>();
+            for (MutableSnapshotItem item : snapshotItems) result.add(item.toSnapshotItem());
+            instance.latestSnapshot.clear();
+            instance.latestSnapshot.addAll(result);
+            System.out.println("[DebugDataCollector] Snapshot collection complete. Items collected: " + result.size());
+            callback.accept(new ContextItem(result, true, ContextItem.Type.SNAPSHOT));
+        };
+
+        currentStackFrame.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                if (children.size() == 0) {
+                    System.out.println("[DebugDataCollector] No children found in stack frame.");
+                    completion.accept(null);
+                    return;
+                }
+                pending.addAndGet(children.size());
+                for (int i = 0; i < children.size(); i++) {
+                    String varName = children.getName(i);
+                    XValue childValue = children.getValue(i);
+                    MutableSnapshotItem mutableItem = new MutableSnapshotItem(varName, "unknown", "unavailable", "Local");
+                    snapshotItems.add(mutableItem);
+                    System.out.println("[DebugDataCollector] Collecting variable: " + varName);
+                    collectSnapshotRecursive(childValue, mutableItem, () -> {
+                        System.out.println("[DebugDataCollector] Collected: " + mutableItem.name + " | Value: " + mutableItem.value + " | Type: " + mutableItem.type);
+                        if (pending.decrementAndGet() == 0) completion.accept(null);
+                    });
+                }
+                if (pending.decrementAndGet() == 0) completion.accept(null);
+            }
+            @Override public void tooManyChildren(int remaining) {}
+            @Override public void setAlreadySorted(boolean alreadySorted) {}
+            @Override public void setErrorMessage(@NotNull String errorMessage) {
+                System.out.println("[DebugDataCollector] Error during snapshot collection: " + errorMessage);
+            }
+            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {
+                System.out.println("[DebugDataCollector] Error during snapshot collection: " + s);
+            }
+            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+        });
+    }
+
+    /** Recursively collect children for a variable. */
+    private static void collectSnapshotRecursive(XValue value, MutableSnapshotItem parent, Runnable onFinish) {
+        value.computePresentation(new XValueNode() {
+            @Override
+            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                try {
+                    if (presentation.getType() != null) parent.type = presentation.getType();
+                    StringBuilder sb = new StringBuilder();
+                    presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
+                        @Override public void renderValue(@NotNull String value) { sb.append(value); }
+                        @Override public void renderStringValue(@NotNull String value) { sb.append(value); }
+                        @Override public void renderNumericValue(@NotNull String value) { sb.append(value); }
+                        @Override public void renderKeywordValue(@NotNull String value) { sb.append(value); }
+                        @Override public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) { sb.append(value); }
+                        @Override public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) { sb.append(value); }
+                        @Override public void renderComment(@NotNull String comment) {}
+                        @Override public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
+                        @Override public void renderError(@NotNull String error) { sb.append(error); }
+                    });
+                    parent.value = sb.toString();
+                    System.out.println("[DebugDataCollector] Presentation OK for: " + parent.name + " | Value: " + parent.value + " | Type: " + parent.type);
+                } catch (Exception e) {
+                    parent.value = "Value not available";
+                    System.out.println("[DebugDataCollector] Error computing value for " + parent.name + ": " + e.getMessage());
+                    if (e.getMessage() != null && e.getMessage().contains("not yet calculated")) {
+                        parent.value = "Calculating...";
+                        System.out.println("[DebugDataCollector] Value for " + parent.name + " is still calculating.");
+                    }
+                }
+                if (hasChildren) {
+                    value.computeChildren(new XCompositeNode() {
+                        @Override
+                        public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                            if (children.size() == 0) {
+                                System.out.println("[DebugDataCollector] No children for object: " + parent.name);
+                                onFinish.run();
+                                return;
+                            }
+                            AtomicInteger childPending = new AtomicInteger(children.size());
+                            for (int i = 0; i < children.size(); i++) {
+                                String childName = children.getName(i);
+                                XValue childVal = children.getValue(i);
+                                MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
+                                parent.children.add(childItem);
+                                System.out.println("[DebugDataCollector] Recursively collecting for child: " + childName + " of parent: " + parent.name);
+                                collectSnapshotRecursive(childVal, childItem, () -> {
+                                    System.out.println("[DebugDataCollector] Collected child: " + childItem.name + " | Value: " + childItem.value + " | Type: " + childItem.type);
+                                    if (childPending.decrementAndGet() == 0) onFinish.run();
+                                });
+                            }
+                        }
+                        @Override public void tooManyChildren(int remaining) {}
+                        @Override public void setAlreadySorted(boolean alreadySorted) {}
+                        @Override public void setErrorMessage(@NotNull String errorMessage) {
+                            System.out.println("[DebugDataCollector] Error during children collection: " + errorMessage);
+                        }
+                        @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {
+                            System.out.println("[DebugDataCollector] Error during children collection: " + s);
+                        }
+                        @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                    });
+                } else {
+                    onFinish.run();
+                }
+            }
+            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+            @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+        }, XValuePlace.TREE);
+    }
+
+// ... (rest of the file unchanged)
