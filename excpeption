@@ -1,0 +1,38 @@
+import java.util.Objects;
+
+/**
+ * Represents full details of an exception collected during debugging, including its full variable tree.
+ * This mirrors what is shown in the IntelliJ debugger window for an exception object.
+ */
+public class ExceptionDetail {
+    private final SnapshotItem exceptionSnapshot; // Full tree of the exception object
+    private final String filePath;
+    private final String type;
+
+    public ExceptionDetail(SnapshotItem exceptionSnapshot, String filePath) {
+        this.exceptionSnapshot = Objects.requireNonNull(exceptionSnapshot, "exceptionSnapshot cannot be null");
+        this.filePath = filePath;
+        this.type = exceptionSnapshot.getType();
+    }
+
+    public SnapshotItem getExceptionSnapshot() {
+        return exceptionSnapshot;
+    }
+
+    public String getFilePath() {
+        return filePath;
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    // Optionally, for easy access to main message/values for UI purposes:
+    public String getExceptionMessage() {
+        return exceptionSnapshot.getValue();
+    }
+
+    public String getName() {
+        return exceptionSnapshot.getName();
+    }
+}
