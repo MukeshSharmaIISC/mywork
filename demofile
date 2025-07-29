@@ -1,26 +1,29 @@
-public class Address {
-    private String city;
-    private String street;
-    private Person resident; // cycle: Address -> Person
+public class Company {
+    private String name;
+    private Address officeAddress;
+    private Person contactPerson; // cycle: Company -> Person
 
-    public Address(String city, String street) {
-        this.city = city;
-        this.street = street;
+    public Company(String name) {
+        this.name = name;
     }
 
-    public void setResident(Person resident) {
-        this.resident = resident;
+    public void setOfficeAddress(Address address) {
+        this.officeAddress = address;
     }
 
-    public String getCity() {
-        return city;
+    public void setContactPerson(Person person) {
+        this.contactPerson = person;
     }
 
-    public String getStreet() {
-        return street;
+    public String getName() {
+        return name;
     }
 
-    public Person getResident() {
-        return resident;
+    public Address getOfficeAddress() {
+        return officeAddress;
+    }
+
+    public Person getContactPerson() {
+        return contactPerson;
     }
 }
