@@ -1,29 +1,18 @@
-public class Company {
-    private String name;
-    private Address officeAddress;
-    private Person contactPerson; // cycle: Company -> Person
+public class MainTest {
+    public static void main(String[] args) {
+        Person person = new Person("Alice");
+        Address address = new Address("Wonderland", "Rabbit Hole St.");
+        Company company = new Company("MadHatter Inc.");
 
-    public Company(String name) {
-        this.name = name;
-    }
+        // Set cross-references (cycles)
+        person.setAddress(address);
+        person.setCompany(company);
 
-    public void setOfficeAddress(Address address) {
-        this.officeAddress = address;
-    }
+        address.setResident(person);
+        company.setOfficeAddress(address);
+        company.setContactPerson(person);
 
-    public void setContactPerson(Person person) {
-        this.contactPerson = person;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public Address getOfficeAddress() {
-        return officeAddress;
-    }
-
-    public Person getContactPerson() {
-        return contactPerson;
+        // Place a breakpoint here to inspect 'person', 'address', 'company'
+        System.out.println("Setup complete. You can inspect the objects now.");
     }
 }
