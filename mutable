@@ -1,0 +1,25 @@
+import java.util.ArrayList;
+import java.util.List;
+
+public class MutableSnapshotItem {
+    public final String name;
+    public String type;
+    public String value;
+    public final String scope;
+    public final List<MutableSnapshotItem> children = new ArrayList<>();
+
+    public MutableSnapshotItem(String name, String type, String value, String scope) {
+        this.name = name;
+        this.type = type;
+        this.value = value;
+        this.scope = scope;
+    }
+
+    public SnapshotItem toSnapshotItem() {
+        List<SnapshotItem> childSnapshots = new ArrayList<>();
+        for (MutableSnapshotItem child : children) {
+            childSnapshots.add(child.toSnapshotItem());
+        }
+        return new SnapshotItem(name, type, value, scope, childSnapshots);
+    }
+}
