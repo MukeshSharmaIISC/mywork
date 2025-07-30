@@ -4,6 +4,7 @@ import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.TextRange;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.*;
 import com.intellij.psi.util.PsiTreeUtil;
@@ -16,30 +17,42 @@ import org.jetbrains.annotations.Nullable;
 import com.intellij.openapi.editor.colors.TextAttributesKey;
 
 import javax.swing.*;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
+/**
+ * DebugDataCollector - VSCode-style logic for callstack, snapshot (BFS/DFS), and exception collection.
+ */
 public class DebugDataCollector {
 
     private static final Logger logger = Logger.getInstance(DebugDataCollector.class);
     private static final DebugDataCollector instance = new DebugDataCollector();
 
+    // ===== Configurable limits =====
+    private static final int MAX_CALLSTACK_ITEMS = 20;
+    private static final int MAX_CALLSTACK_JSON_SIZE = 10000;
+    private static final int MAX_SNAPSHOT_DEPTH = 6;
+    private static final int MAX_DEBUGGER_CALLS = 200;
+    private static final int MAX_SNAPSHOT_JSON_SIZE = 25000;
+    private static final int MAX_STACKTRACE_LINES = 20;
+
+    // ===== Internal state =====
+    private final List<StackItem> latestStack = new ArrayList<>();
+    private final List<SnapshotItem> latestSnapshot = new ArrayList<>();
+    private ExceptionDetail latestException = null;
+
     public static DebugDataCollector getInstance() {
         return instance;
     }
 
-    private final List<SnapshotItem> latestSnapshot = new ArrayList<>();
-    private final List<StackItem> latestStack = new ArrayList<>();
-    private ExceptionDetail latestException = null;
+    public List<StackItem> getCallStack() {
+        return new ArrayList<>(latestStack);
+    }
 
     public List<SnapshotItem> getSnapshot() {
         return new ArrayList<>(latestSnapshot);
-    }
-
-    public List<StackItem> getCallStack() {
-        return new ArrayList<>(latestStack);
     }
 
     public ExceptionDetail getExceptionDetail() {
@@ -47,74 +60,98 @@ public class DebugDataCollector {
     }
 
     public void clearDebugData() {
-        latestSnapshot.clear();
         latestStack.clear();
+        latestSnapshot.clear();
         latestException = null;
     }
 
-    // ================= Stack Items (unchanged) ====================
+    // ====== Snapshot Traversal Style ======
+    public enum SnapshotStyle { DFS, BFS }
+
+    // ========== Callstack Collection ===========
     public static void collectStackItems(XDebugProcess debugProcess, Consumer<ContextItem> callback) {
+        instance.latestStack.clear();
         List<StackItem> stackItems = new ArrayList<>();
         XExecutionStack stack = debugProcess.getSession().getSuspendContext().getActiveExecutionStack();
         if (stack == null) {
-            callback.accept(new ContextItem(stackItems, false, ContextItem.Type.STACK));
+            callback.accept(new ContextItem(stackItems, false, ContextItemType.STACK));
             return;
         }
         stack.computeStackFrames(0, new XExecutionStack.XStackFrameContainer() {
             @Override
             public void addStackFrames(@NotNull List<? extends XStackFrame> frames, boolean last) {
+                String workspacePath = getWorkspacePath(debugProcess.getSession().getProject());
                 for (XStackFrame frame : frames) {
                     XSourcePosition pos = frame.getSourcePosition();
                     if (pos != null) {
                         String file = pos.getFile().getPath();
                         int line = pos.getLine() + 1;
-                        String language = pos.getFile().getExtension(), functionText = extractEnclosingFunction(debugProcess.getSession().getProject(), pos.getFile(), pos.getLine());
-                        stackItems.add(new StackItem(file, line, functionText != null ? functionText : "", language));
+                        String language = pos.getFile().getExtension();
+                        String functionText = extractEnclosingFunction(debugProcess.getSession().getProject(), pos.getFile(), pos.getLine());
+                        String currentLine = getLineText(pos.getFile(), pos.getLine());
+                        stackItems.add(new StackItem(file, line, functionText != null ? functionText : "", language, currentLine));
                     }
                 }
+                // Filter and trim
+                if (workspacePath != null && !workspacePath.isEmpty()) {
+                    stackItems = stackItems.stream()
+                        .filter(item -> item.filePath.startsWith(workspacePath))
+                        .collect(Collectors.toList());
+                }
+                if (stackItems.size() > MAX_CALLSTACK_ITEMS)
+                    stackItems = stackItems.subList(0, MAX_CALLSTACK_ITEMS);
+                while (!stackItems.isEmpty() && toJson(stackItems).length() > MAX_CALLSTACK_JSON_SIZE)
+                    stackItems.remove(stackItems.size() - 1);
+
                 instance.latestStack.clear();
                 instance.latestStack.addAll(stackItems);
-                callback.accept(new ContextItem(stackItems, true, ContextItem.Type.STACK));
+                callback.accept(new ContextItem(stackItems, true, ContextItemType.STACK));
             }
             @Override public void errorOccurred(@NotNull String errorMessage) {
-                callback.accept(new ContextItem(stackItems, false, ContextItem.Type.STACK));
+                callback.accept(new ContextItem(stackItems, false, ContextItemType.STACK));
             }
         });
     }
 
-    // ================== Recursive Snapshot Collection ====================
-    public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
-        List<MutableSnapshotItem> snapshotItems = new ArrayList<>();
-        XSourcePosition sourcePosition = currentStackFrame.getSourcePosition();
-        String ext = sourcePosition != null ? sourcePosition.getFile().getExtension() : null;
-        AtomicInteger pending = new AtomicInteger(1);
+    // ========== Snapshot Collection (DFS and BFS) ===========
+    public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback, SnapshotStyle style) {
+        instance.latestSnapshot.clear();
+        long startTime = System.currentTimeMillis();
 
-        Consumer<Void> completion = (v) -> {
-            List<SnapshotItem> result = new ArrayList<>();
-            for (MutableSnapshotItem item : snapshotItems) result.add(item.toSnapshotItem());
-            instance.latestSnapshot.clear();
-            instance.latestSnapshot.addAll(result);
-            callback.accept(new ContextItem(result, true, ContextItem.Type.SNAPSHOT));
-        };
+        if (style == SnapshotStyle.DFS) {
+            collectSnapshotDFS(currentStackFrame, callback, startTime);
+        } else {
+            collectSnapshotBFS(currentStackFrame, callback, startTime);
+        }
+    }
 
-        currentStackFrame.computeChildren(new XCompositeNode() {
+    // DFS approach
+    private static void collectSnapshotDFS(XStackFrame frame, Consumer<ContextItem> callback, long startTime) {
+        List<SnapshotItem> snapshotItems = new ArrayList<>();
+        AtomicInteger callsCount = new AtomicInteger(0);
+
+        frame.computeChildren(new XCompositeNode() {
             @Override
             public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                if (children.size() == 0) {
-                    completion.accept(null);
-                    return;
-                }
-                pending.addAndGet(children.size());
+                AtomicInteger pending = new AtomicInteger(children.size());
                 for (int i = 0; i < children.size(); i++) {
                     String varName = children.getName(i);
                     XValue childValue = children.getValue(i);
-                    MutableSnapshotItem mutableItem = new MutableSnapshotItem(varName, "unknown", "unavailable", "Local");
-                    snapshotItems.add(mutableItem);
-                    collectSnapshotRecursive(childValue, mutableItem, () -> {
-                        if (pending.decrementAndGet() == 0) completion.accept(null);
+                    if (shouldSkipVariable(varName)) {
+                        if (pending.decrementAndGet() == 0) finish();
+                        continue;
+                    }
+                    collectVariableDFS(childValue, varName, 1, snapshotItems, callsCount, () -> {
+                        if (pending.decrementAndGet() == 0) finish();
                     });
                 }
-                if (pending.decrementAndGet() == 0) completion.accept(null);
+                if (children.size() == 0) finish();
+            }
+            private void finish() {
+                instance.latestSnapshot.clear();
+                instance.latestSnapshot.addAll(snapshotItems);
+                logSnapshotStats("DFS", startTime, callsCount.get(), snapshotItems);
+                callback.accept(new ContextItem(snapshotItems, true, ContextItemType.SNAPSHOT));
             }
             @Override public void tooManyChildren(int remaining) {}
             @Override public void setAlreadySorted(boolean alreadySorted) {}
@@ -124,51 +161,33 @@ public class DebugDataCollector {
         });
     }
 
-    /** Recursively collect children for a variable. */
-    private static void collectSnapshotRecursive(XValue value, MutableSnapshotItem parent, Runnable onFinish) {
+    private static void collectVariableDFS(XValue value, String name, int depth, List<SnapshotItem> out, AtomicInteger callsCount, Runnable onFinish) {
+        if (depth > MAX_SNAPSHOT_DEPTH || callsCount.get() > MAX_DEBUGGER_CALLS)
+            { onFinish.run(); return; }
         value.computePresentation(new XValueNode() {
             @Override
             public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                try {
-                    if (presentation.getType() != null) parent.type = presentation.getType();
-                    StringBuilder sb = new StringBuilder();
-                    presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
-                        @Override public void renderValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderStringValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderNumericValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderKeywordValue(@NotNull String value) { sb.append(value); }
-                        @Override public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) { sb.append(value); }
-                        @Override public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) { sb.append(value); }
-                        @Override public void renderComment(@NotNull String comment) {}
-                        @Override public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
-                        @Override public void renderError(@NotNull String error) { sb.append(error); }
-                    });
-                    parent.value = sb.toString();
-                } catch (Exception e) {
-                    logger.warn("Error computing value for " + parent.name + ": " + e.getMessage());
-                    parent.value = "Value not available";
-                    if (e.getMessage() != null && e.getMessage().contains("not yet calculated")) {
-                        parent.value = "Calculating...";
-                    }
-                }
+                callsCount.incrementAndGet();
+                String type = presentation.getType() != null ? presentation.getType() : "unknown";
+                String val = extractValueFromPresentation(presentation);
+                SnapshotItem item = new SnapshotItem(name, type, val, new ArrayList<>());
                 if (hasChildren) {
                     value.computeChildren(new XCompositeNode() {
                         @Override
                         public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                            if (children.size() == 0) {
-                                onFinish.run();
-                                return;
-                            }
-                            AtomicInteger childPending = new AtomicInteger(children.size());
+                            AtomicInteger pending = new AtomicInteger(children.size());
                             for (int i = 0; i < children.size(); i++) {
                                 String childName = children.getName(i);
                                 XValue childVal = children.getValue(i);
-                                MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
-                                parent.children.add(childItem);
-                                collectSnapshotRecursive(childVal, childItem, () -> {
-                                    if (childPending.decrementAndGet() == 0) onFinish.run();
+                                if (shouldSkipVariable(childName)) {
+                                    if (pending.decrementAndGet() == 0) { out.add(item); onFinish.run(); }
+                                    continue;
+                                }
+                                collectVariableDFS(childVal, childName, depth + 1, item.children, callsCount, () -> {
+                                    if (pending.decrementAndGet() == 0) { out.add(item); onFinish.run(); }
                                 });
                             }
+                            if (children.size() == 0) { out.add(item); onFinish.run(); }
                         }
                         @Override public void tooManyChildren(int remaining) {}
                         @Override public void setAlreadySorted(boolean alreadySorted) {}
@@ -177,7 +196,7 @@ public class DebugDataCollector {
                         @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
                     });
                 } else {
-                    onFinish.run();
+                    out.add(item); onFinish.run();
                 }
             }
             @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
@@ -185,51 +204,102 @@ public class DebugDataCollector {
         }, XValuePlace.TREE);
     }
 
-    // ================== Recursive Exception Collection ====================
-    public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
-        logger.debug("[collectException] Starting exception collection for frame: " + frame);
-        XSourcePosition sourcePosition = frame.getSourcePosition();
-        String filePath = sourcePosition != null ? sourcePosition.getFile().getPath() : "unknown";
+    // BFS approach
+    private static void collectSnapshotBFS(XStackFrame frame, Consumer<ContextItem> callback, long startTime) {
+        List<SnapshotItem> snapshotItems = new ArrayList<>();
+        AtomicInteger callsCount = new AtomicInteger(0);
+
         frame.computeChildren(new XCompositeNode() {
             @Override
             public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                boolean foundException = false;
+                Queue<Pair<XValue, SnapshotItem>> queue = new LinkedList<>();
+                for (int i = 0; i < children.size(); i++) {
+                    String varName = children.getName(i);
+                    XValue childValue = children.getValue(i);
+                    if (shouldSkipVariable(varName)) continue;
+                    SnapshotItem item = new SnapshotItem(varName, "unknown", "unavailable", new ArrayList<>());
+                    snapshotItems.add(item);
+                    queue.add(new Pair<>(childValue, item));
+                }
+                int totalJsonSize = 0;
+                while (!queue.isEmpty() && callsCount.get() < MAX_DEBUGGER_CALLS && totalJsonSize < MAX_SNAPSHOT_JSON_SIZE) {
+                    Pair<XValue, SnapshotItem> pair = queue.poll();
+                    XValue value = pair.first;
+                    SnapshotItem parent = pair.second;
+                    value.computePresentation(new XValueNode() {
+                        @Override
+                        public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                            callsCount.incrementAndGet();
+                            if (presentation.getType() != null) parent.type = presentation.getType();
+                            parent.value = extractValueFromPresentation(presentation);
+                            if (hasChildren) {
+                                value.computeChildren(new XCompositeNode() {
+                                    @Override
+                                    public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                        for (int i = 0; i < children.size(); i++) {
+                                            String childName = children.getName(i);
+                                            XValue childVal = children.getValue(i);
+                                            if (shouldSkipVariable(childName)) continue;
+                                            SnapshotItem childItem = new SnapshotItem(childName, "unknown", "unavailable", new ArrayList<>());
+                                            parent.children.add(childItem);
+                                            queue.add(new Pair<>(childVal, childItem));
+                                        }
+                                    }
+                                    @Override public void tooManyChildren(int remaining) {}
+                                    @Override public void setAlreadySorted(boolean alreadySorted) {}
+                                    @Override public void setErrorMessage(@NotNull String errorMessage) {}
+                                    @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                                    @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                                });
+                            }
+                        }
+                        @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                        @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+                    }, XValuePlace.TREE);
+                    totalJsonSize = toJson(snapshotItems).length();
+                }
+                instance.latestSnapshot.clear();
+                instance.latestSnapshot.addAll(snapshotItems);
+                logSnapshotStats("BFS", startTime, callsCount.get(), snapshotItems);
+                callback.accept(new ContextItem(snapshotItems, true, ContextItemType.SNAPSHOT));
+            }
+            @Override public void tooManyChildren(int remaining) {}
+            @Override public void setAlreadySorted(boolean alreadySorted) {}
+            @Override public void setErrorMessage(@NotNull String errorMessage) {}
+            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
+            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+        });
+    }
+
+    // ========== Exception Collection (Clipped) ===========
+    public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
+        instance.latestException = null;
+        frame.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
                 for (int i = 0; i < children.size(); i++) {
                     String name = children.getName(i);
                     XValue value = children.getValue(i);
-                    boolean isExceptionCandidate = (name != null && name.toLowerCase().contains("exception"));
-                    String[] type = {"unknown"};
-                    ValueDescriptorImpl descriptor = null;
-                    if (value instanceof NodeDescriptorProvider nodeProvider) {
-                        descriptor = (ValueDescriptorImpl) nodeProvider.getDescriptor();
-                        value.computePresentation(new XValueNode() {
-                            @Override
-                            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                                String typeStr = presentation.getType();
-                                if (typeStr != null && typeStr.toLowerCase().contains("exception")) {
-                                    type[0] = typeStr;
-                                }
-                            }
-                            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                            @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
-                        }, XValuePlace.TREE);
-                    }
-                    if (isExceptionCandidate && descriptor != null) {
-                        foundException = true;
-                        // Recursively collect all fields of the exception object
-                        MutableSnapshotItem rootExceptionItem = new MutableSnapshotItem(name, type[0], descriptor.getValue() != null ? descriptor.getValue().toString() : "null", "Exception");
-                        AtomicInteger pending = new AtomicInteger(1);
-                        collectSnapshotRecursive(value, rootExceptionItem, () -> {
-                            instance.latestException = new ExceptionDetail(rootExceptionItem.toSnapshotItem(), filePath);
-                            callback.accept(new ContextItem(instance.latestException, true, ContextItem.Type.EXCEPTION));
-                        });
-                        break; // Only first matching exception
-                    }
+                    if (name == null || !name.toLowerCase().contains("exception")) continue;
+
+                    value.computePresentation(new XValueNode() {
+                        @Override
+                        public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                            String typeName = presentation.getType() != null ? presentation.getType() : "Exception";
+                            String message = extractValueFromPresentation(presentation);
+                            String stackTrace = getStackTraceFromChildren(value);
+                            stackTrace = clipStackTrace(stackTrace);
+                            String source = frame.getSourcePosition() != null ? frame.getSourcePosition().getFile().getPath() : "unknown";
+                            ExceptionDetail detail = new ExceptionDetail(message, typeName, stackTrace, source);
+                            instance.latestException = detail;
+                            callback.accept(new ContextItem(detail, true, ContextItemType.EXCEPTION));
+                        }
+                        @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                        @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+                    }, XValuePlace.TREE);
+                    return; // Only first matching exception
                 }
-                // If no exception found, fallback: collect all variables as a snapshot
-                if (!foundException) {
-                    collectSnapshot(frame, callback);
-                }
+                callback.accept(new ContextItem(null, false, ContextItemType.EXCEPTION));
             }
             @Override public void tooManyChildren(int remaining) {}
             @Override public void setAlreadySorted(boolean alreadySorted) {}
@@ -237,6 +307,84 @@ public class DebugDataCollector {
             @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { logger.debug("[collectException] Error: " + s); }
             @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
         });
+    }
+
+    // ========== Helpers ===========
+    private static String getWorkspacePath(Project project) {
+        return project.getBasePath();
+    }
+    private static String getLineText(VirtualFile file, int line) {
+        Document doc = FileDocumentManager.getInstance().getDocument(file);
+        if (doc != null && line < doc.getLineCount()) {
+            int start = doc.getLineStartOffset(line);
+            int end = doc.getLineEndOffset(line);
+            return doc.getText(new TextRange(start, end)).trim();
+        }
+        return "";
+    }
+    private static String toJson(Object obj) {
+        try {
+            return new com.google.gson.Gson().toJson(obj);
+        } catch (Throwable t) {
+            logger.warn("JSON serialization failed: " + t.getMessage());
+            return "";
+        }
+    }
+    private static boolean shouldSkipVariable(String name) {
+        return name == null || name.contains(" ") || name.startsWith("__") || name.startsWith("&") || name.startsWith("$");
+    }
+    private static String extractValueFromPresentation(XValuePresentation presentation) {
+        StringBuilder sb = new StringBuilder();
+        presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
+            @Override public void renderValue(@NotNull String value) { sb.append(value); }
+            @Override public void renderStringValue(@NotNull String value) { sb.append(value); }
+            @Override public void renderNumericValue(@NotNull String value) { sb.append(value); }
+            @Override public void renderKeywordValue(@NotNull String value) { sb.append(value); }
+            @Override public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) { sb.append(value); }
+            @Override public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) { sb.append(value); }
+            @Override public void renderComment(@NotNull String comment) {}
+            @Override public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
+            @Override public void renderError(@NotNull String error) { sb.append(error); }
+        });
+        return sb.toString();
+    }
+    private static void logSnapshotStats(String style, long startTime, int calls, List<SnapshotItem> items) {
+        logger.debug(String.format("[%s] Snapshot fetch completed in %.2fs, calls: %d, size: %d bytes",
+            style, (System.currentTimeMillis() - startTime) / 1000.0, calls, toJson(items).length()));
+    }
+    private static String getStackTraceFromChildren(XValue value) {
+        List<String> stackLines = new ArrayList<>();
+        value.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                for (int i = 0; i < children.size(); i++) {
+                    String name = children.getName(i);
+                    XValue childValue = children.getValue(i);
+                    if ("stackTrace".equalsIgnoreCase(name)) {
+                        childValue.computePresentation(new XValueNode() {
+                            @Override
+                            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                stackLines.add(extractValueFromPresentation(presentation));
+                            }
+                            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                            @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+                        }, XValuePlace.TREE);
+                    }
+                }
+            }
+            @Override public void tooManyChildren(int remaining) {}
+            @Override public void setAlreadySorted(boolean alreadySorted) {}
+            @Override public void setErrorMessage(@NotNull String errorMessage) {}
+            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
+            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+        });
+        return String.join("\n", stackLines);
+    }
+    private static String clipStackTrace(String stackTrace) {
+        String[] lines = stackTrace.split("\n");
+        if (lines.length > MAX_STACKTRACE_LINES)
+            return String.join("\n", Arrays.copyOf(lines, MAX_STACKTRACE_LINES));
+        return stackTrace;
     }
 
     @Nullable
@@ -263,25 +411,62 @@ public class DebugDataCollector {
         });
     }
 
-    // === Exception message and stack trace helpers ===
-    public String getExceptionMessage() {
-        ExceptionDetail ex = getExceptionDetail();
-        return ex != null ? findChildValue(ex.getExceptionSnapshot(), "message", "detailMessage") : null;
-    }
-
-    public String getExceptionStackTrace() {
-        ExceptionDetail ex = getExceptionDetail();
-        return ex != null ? findChildValue(ex.getExceptionSnapshot(), "stackTrace") : null;
-    }
-
-    private String findChildValue(SnapshotItem item, String... possibleNames) {
-        for (String name : possibleNames) {
-            if (item.getName().equals(name)) return item.getValue();
+    // ==== Data Classes with VSCode-style output ====
+    public static class StackItem {
+        public String filePath;
+        public int lineNumber;
+        public String enclosingFunction;
+        public String language;
+        public String currentLine;
+        public StackItem(String filePath, int lineNumber, String enclosingFunction, String language, String currentLine) {
+            this.filePath = filePath;
+            this.lineNumber = lineNumber;
+            this.enclosingFunction = enclosingFunction;
+            this.language = language;
+            this.currentLine = currentLine;
         }
-        for (SnapshotItem child : item.getChildren()) {
-            String result = findChildValue(child, possibleNames);
-            if (result != null) return result;
+    }
+    public static class SnapshotItem {
+        public String name;
+        public String type;
+        public String value;
+        public List<SnapshotItem> children;
+        public SnapshotItem(String name, String type, String value, List<SnapshotItem> children) {
+            this.name = name;
+            this.type = type;
+            this.value = value;
+            this.children = children != null ? children : new ArrayList<>();
         }
-        return null;
+    }
+    public static class ExceptionDetail {
+        public String message;
+        public String typeName;
+        public String stackTrace;
+        public String source;
+        public ExceptionDetail(String message, String typeName, String stackTrace, String source) {
+            this.message = message;
+            this.typeName = typeName;
+            this.stackTrace = stackTrace;
+            this.source = source;
+        }
+    }
+    public static class ContextItem {
+        public Object value;
+        public boolean isSuccess;
+        public ContextItemType type;
+        public ContextItem(Object value, boolean isSuccess, ContextItemType type) {
+            this.value = value;
+            this.isSuccess = isSuccess;
+            this.type = type;
+        }
+    }
+    public enum ContextItemType { STACK, SNAPSHOT, EXCEPTION }
+    private static class Pair<F, S> {
+        public final F first;
+        public final S second;
+        public Pair(F first, S second) {
+            this.first = first;
+            this.second = second;
+        }
     }
 }
