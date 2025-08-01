@@ -1,0 +1,183 @@
+import com.intellij.debugger.ui.breakpoints.JavaExceptionBreakpointType;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ProjectManager;
+import com.intellij.openapi.startup.StartupActivity;
+import com.intellij.xdebugger.*;
+import com.intellij.xdebugger.breakpoints.XBreakpoint;
+import com.intellij.xdebugger.frame.*;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class DebugAttacher implements StartupActivity {
+    private static final Logger logger = Logger.getInstance(DebugAttacher.class);
+
+    @Override
+    public void runActivity(@NotNull Project project) {
+        System.out.println("Activity Started");
+        attachDebugStartListener(project);
+    }
+
+    public void sessionStopped() {
+        System.out.println("[DEBUG] Debug session stopped - cleaning up");
+        DebugDataCollector.getInstance().clearDebugData();
+        System.out.println("[DEBUG] Debug data cleared");
+        System.out.println("[DEBUG] UI notified of session stop");
+    }
+
+    private void attachDebugStartListener(Project project) {
+        project.getMessageBus().connect().subscribe(XDebuggerManager.TOPIC, new XDebuggerManagerListener() {
+            @Override
+            public void processStarted(@NotNull XDebugProcess debugProcess) {
+                System.out.println("Debug session started");
+                enableExceptionBreakpoints(project);
+                attachDebugBreakListener(debugProcess);
+            }
+        });
+    }
+
+    private void enableExceptionBreakpoints(Project project) {
+        var breakpoints = XDebuggerManager.getInstance(project).getBreakpointManager().getAllBreakpoints();
+        for (XBreakpoint<?> bp : breakpoints) {
+            if (bp.getType() instanceof JavaExceptionBreakpointType) {
+                bp.setEnabled(true);
+            }
+        }
+    }
+
+    private void attachDebugBreakListener(@NotNull XDebugProcess debugProcess) {
+        debugProcess.getSession().addSessionListener(new XDebugSessionListener() {
+            @Override
+            public void sessionPaused() {
+                handleDebugEvent(debugProcess);
+            }
+
+            @Override
+            public void stackFrameChanged() {
+                handleDebugEvent(debugProcess);
+            }
+
+            @Override
+            public void sessionStopped() {
+                DebugAttacher.this.sessionStopped();
+            }
+        });
+    }
+
+    private void handleDebugEvent(@NotNull XDebugProcess debugProcess) {
+        XStackFrame currentFrame = debugProcess.getSession().getCurrentStackFrame();
+        if (currentFrame == null) return;
+
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            try {
+                Thread.sleep(100);
+                DebugDataCollector.collectStackItems(debugProcess, stack -> {});
+                // Use BFS for snapshot collection by default
+                int retries = 3;
+                while (retries-- > 0) {
+                    try {
+                        DebugDataCollector.collectSnapshot(currentFrame, snapshot -> {}, DebugDataCollector.SnapshotStyle.BFS);
+                        break;
+                    } catch (Exception e) {
+                        if (retries > 0) {
+                            Thread.sleep(200);
+                        } else {
+                            logger.warn("Failed to collect snapshot after retries: " + e.getMessage());
+                        }
+                    }
+                }
+                DebugDataCollector.collectException(currentFrame, exception -> {
+                    if (exception != null && exception.isSuccess) {
+                        // TODO: Handle Exception Data here (e.g., report to UI)
+                    }
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("Debug data collection interrupted", e);
+            } catch (Exception e) {
+                logger.error("Error during debug data collection", e);
+            }
+        });
+    }
+
+    public static boolean isPaused(Project project) {
+        try {
+            XDebugSession session = XDebuggerManager.getInstance(project).getCurrentSession();
+            if (session != null) {
+                System.out.println("[DEBUG] Found session in provided project: " + project.getName());
+                return session.isPaused();
+            }
+            for (Project openProject : ProjectManager.getInstance().getOpenProjects()) {
+                if (openProject.equals(project)) continue;
+                session = XDebuggerManager.getInstance(openProject).getCurrentSession();
+                if (session != null) {
+                    System.out.println("[DEBUG] Found session in project: " + openProject.getName());
+                    return session.isPaused();
+                }
+            }
+            System.out.println("[DEBUG] No active debug session found in any project");
+            return false;
+        } catch (Exception e) {
+            System.out.println("[DEBUG] Error checking debug sessions: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public static Map<String, Boolean> getDefaultDebugItems() {
+        Map<String, Boolean> defaultItems = new HashMap<>();
+        defaultItems.put("callstack", false);
+        defaultItems.put("snapshot", false);
+        defaultItems.put("exception", false);
+        return defaultItems;
+    }
+
+    public static String getDebugInfoFor(String command) {
+        switch (command) {
+            case "snapshot": {
+                List<DebugDataCollector.SnapshotItem> snapshotItems = DebugDataCollector.getInstance().getSnapshot();
+                if (snapshotItems == null || snapshotItems.isEmpty()) {
+                    System.out.println("Snapshot is null or empty");
+                    return null;
+                }
+                StringBuilder snapshotBuilder = new StringBuilder();
+                for (DebugDataCollector.SnapshotItem item : snapshotItems) {
+                    snapshotBuilder.append(item.name).append(": ").append(item.value).append("\n");
+                }
+                String snapshotResult = snapshotBuilder.toString().trim();
+                System.out.println("Snapshot result:\n" + snapshotResult);
+                return snapshotResult;
+            }
+            case "callstack": {
+                List<DebugDataCollector.StackItem> stackItems = DebugDataCollector.getInstance().getCallStack();
+                if (stackItems == null || stackItems.isEmpty()) {
+                    System.out.println("Call stack is null or empty");
+                    return null;
+                }
+                StringBuilder stackBuilder = new StringBuilder();
+                for (DebugDataCollector.StackItem item : stackItems) {
+                    stackBuilder.append(item.enclosingFunction)
+                            .append(" at ").append(item.filePath).append(":").append(item.lineNumber).append("\n");
+                }
+                String stackResult = stackBuilder.toString().trim();
+                System.out.println("Stack result:\n" + stackResult);
+                return stackResult;
+            }
+            case "exception": {
+                DebugDataCollector.ExceptionDetail ex = DebugDataCollector.getInstance().getExceptionDetail();
+                if (ex == null) {
+                    System.out.println("Exception detail is null or empty");
+                    return null;
+                }
+                String exceptionResult = ((ex.message != null ? ex.message : "") + "\n" + (ex.stackTrace != null ? ex.stackTrace : "")).trim();
+                System.out.println("Exception result:\n" + exceptionResult);
+                return exceptionResult;
+            }
+            default:
+                System.out.println("Unknown debug command: " + command);
+                return null;
+        }
+    }
+}
