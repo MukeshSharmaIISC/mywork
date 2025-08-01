@@ -1,0 +1,59 @@
+[
+  {
+    "name": "counter",
+    "type": "int",
+    "value": "42",
+    "children": []
+  },
+  {
+    "name": "user",
+    "type": "User",
+    "value": "[object]",
+    "children": [
+      {
+        "name": "name",
+        "type": "String",
+        "value": "Alice",
+        "children": []
+      },
+      {
+        "name": "age",
+        "type": "int",
+        "value": "30",
+        "children": []
+      }
+    ]
+  },
+  {
+    "name": "book",
+    "type": "Book",
+    "value": "[object]",
+    "children": [
+      {
+        "name": "title",
+        "type": "String",
+        "value": "Java Fundamentals",
+        "children": []
+      },
+      {
+        "name": "author",
+        "type": "Author",
+        "value": "[object]",
+        "children": [
+          {
+            "name": "name",
+            "type": "String",
+            "value": "Bob Smith",
+            "children": []
+          },
+          {
+            "name": "id",
+            "type": "int",
+            "value": "1234",
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+]
