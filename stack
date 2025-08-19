@@ -1,17 +1,27 @@
-package org.dell;
+package org.samsung.aipp.aippintellij.debugAssist;
 
 public class StackItem {
-    private final String function;
-    private final String filePath;
-    private final int line;
+    private String filePath;
+    private int line;
+    private String function;
+    private String language;
 
-    public StackItem(String function, String filePath, int line) {
-        this.function = function;
+    public StackItem(String filePath, int line, String function, String language) {
         this.filePath = filePath;
         this.line = line;
+        this.function = function;
+        this.language = language;
     }
 
-    public String getFunction() { return function; }
     public String getFilePath() { return filePath; }
+    public void setFilePath(String filePath) { this.filePath = filePath; }
+
     public int getLine() { return line; }
+    public void setLine(int line) { this.line = line; }
+
+    public String getFunction() { return function; }
+    public void setFunction(String function) { this.function = function; }
+
+    public String getLanguage() { return language; }
+    public void setLanguage(String language) { this.language = language; }
 }
