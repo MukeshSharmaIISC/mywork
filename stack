@@ -6,6 +6,7 @@ public class StackItem {
     private String function;
     private String language;
 
+    // Correct constructor with 4 arguments
     public StackItem(String filePath, int line, String function, String language) {
         this.filePath = filePath;
         this.line = line;
