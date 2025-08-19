@@ -1,4 +1,45 @@
 
+/**
+ * Unified handler for both IntelliJ (Java) and PyCharm (Python) debug values.
+ * Uses reflection to avoid hard dependency on PyCharm classes.
+ */
+private static Object handleDebugValue(Object valueObj) {
+    if (valueObj instanceof ValueDescriptorImpl) {
+        ValueDescriptorImpl vd = (ValueDescriptorImpl) valueObj;
+        try {
+            return vd.getName() + " = " + vd.calcValueName();
+        } catch (Exception e) {
+            return vd.getName() + " = <error>";
+        }
+    } else {
+        try {
+            // Try resolving PyCharm's PyDebugValue via reflection
+            Class<?> pyValClass = Class.forName("com.jetbrains.python.debugger.PyDebugValue");
+            if (pyValClass.isInstance(valueObj)) {
+                Object name = pyValClass.getMethod("getName").invoke(valueObj);
+                Object val = pyValClass.getMethod("getValue").invoke(valueObj);
+                return String.format("%s = %s", name, val);
+            }
+        } catch (ClassNotFoundException cnfe) {
+            // PyCharm class not available (running in IntelliJ), ignore
+        } catch (Exception e) {
+            // Reflection failure, ignore gracefully
+        }
+
+        // Fallback for other object types
+        return String.valueOf(valueObj);
+    }
+}
+
+
+
+
+
+
+
+
+
+
 import com.google.gson.Gson; 
 
 import com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider; 
