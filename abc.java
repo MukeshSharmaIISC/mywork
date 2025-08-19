@@ -1,99 +1,11 @@
-package your.package; // <-- Change this to your real package
+Refactor the file DebugDataCollector.java so it works robustly for Java (IntelliJ IDEA), Kotlin, and Python (PyCharm) in JetBrains IDEs.
 
-import com.intellij.codeInsight.completion.*;
-import com.intellij.codeInsight.lookup.LookupElementBuilder;
-import com.intellij.codeInsight.lookup.LookupElement;
-import com.intellij.codeInsight.lookup.PrioritizedLookupElement;
-import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.diagnostic.Logger;
-import com.intellij.openapi.editor.Document;
-import com.intellij.openapi.project.Project;
-import com.intellij.openapi.util.Computable;
-import com.intellij.openapi.util.Key;
-import com.intellij.openapi.util.TextRange;
-import com.intellij.patterns.PlatformPatterns;
-import com.intellij.psi.*;
-import com.intellij.psi.util.PsiTreeUtil;
-import com.intellij.util.ProcessingContext;
-import org.jetbrains.annotations.NotNull;
-import com.intellij.debugger.DebuggerManagerEx;
-import com.intellij.debugger.impl.DebuggerSession;
-import org.samsung.aipp.aippintellij.chat.ChatApiCallService;
-import java.util.List;
-import static org.samsung.aipp.aippintellij.util.Constants.SERVER_TIMEOUT;
-
-public class BreakpointCompletionProvider extends CompletionContributor {
-    private static final Logger logger = Logger.getInstance(BreakpointCompletionProvider.class);
-
-    // Unique key for our suggestions
-    public static final Key<Boolean> CODE_I_SUGGESTION_KEY = Key.create("code.i.suggestion");
-
-    public BreakpointCompletionProvider() {
-        extend(CompletionType.BASIC, PlatformPatterns.psiElement().inFile(PlatformPatterns.psiFile(JavaCodeFragment.class)), new CompletionProvider<>() {
-            @Override
-            protected void addCompletions(@NotNull CompletionParameters parameters, @NotNull ProcessingContext context, @NotNull CompletionResultSet resultSet) {
-                PsiElement element = parameters.getPosition();
-                PsiFile fragmentFile = ApplicationManager.getApplication().runReadAction((Computable<PsiFile>) element::getContainingFile);
-                if (!(fragmentFile instanceof JavaCodeFragment fragment)) {
-                    logger.info("[DEBUG] Not a JavaCodeFragment, exiting");
-                    return;
-                }
-                PsiElement contextElement = fragment.getContext();
-                if (contextElement == null) return;
-                PsiFile containingFile = contextElement.getContainingFile();
-                Project project = containingFile.getProject();
-                Document mainDocument = PsiDocumentManager.getInstance(project).getDocument(containingFile);
-                if (mainDocument == null) return;
-                int lineNumber = mainDocument.getLineNumber(contextElement.getTextOffset());
-                String currentLine = mainDocument.getText(new TextRange(mainDocument.getLineStartOffset(lineNumber), mainDocument.getLineEndOffset(lineNumber))).trim();
-                PsiMethod enclosingMethod = PsiTreeUtil.getParentOfType(contextElement, PsiMethod.class);
-                String enclosingFunction = (enclosingMethod != null) ? enclosingMethod.getText() : "", fileContext = containingFile.getText(), filePath = (containingFile.getVirtualFile() != null) ? containingFile.getVirtualFile().getPath() : "";
-                boolean debugSession = isInDebugSession(project);
-                String callstack = "", snapshot = "", exception = "";
-                if (debugSession) try {
-                    DebugDataCollector collector = DebugDataCollector.getInstance();
-                    snapshot = collector.getSnapshot() != null ? collector.getSnapshot().toString() : "";
-                    callstack = collector.getCallStack() != null ? collector.getCallStack().toString() : "";
-                    ExceptionDetail ex = collector.getExceptionDetail();
-                    exception = (ex != null) ? ex.toString() : "";
-                } catch (Throwable t) {
-                    logger.info("[DEBUG] Could not collect debug session data: " + t.getMessage());
-                }
-                BreakpointCompletionPayload payload = new BreakpointCompletionPayload("conditional_breakpoint", currentLine, enclosingFunction, fileContext, "JAVA", filePath, lineNumber + 1, debugSession, callstack, snapshot, exception);
-                List<String> response = ChatApiCallService.fetchServerSuggestions(payload, SERVER_TIMEOUT);
-
-                for (String suggestion : response) {
-                    LookupElementBuilder builder = LookupElementBuilder.create(suggestion)
-                            .withTailText(" (code.i suggestion)")
-                            .withBoldness(true)
-                            .withInsertHandler((contexts, item) -> {
-                                int startOffset = contexts.getStartOffset();
-                                int tailOffset = contexts.getTailOffset();
-                                String originalText = contexts.getDocument().getText(new TextRange(startOffset, tailOffset));
-                                logger.info("[DEBUG] In InsertHandler: suggestion=" + suggestion +
-                                        ", startOffset=" + startOffset +
-                                        ", tailOffset=" + tailOffset +
-                                        ", originalTextToBeReplaced='" + originalText + "'" +
-                                        ", doc length=" + contexts.getDocument().getTextLength());
-                                contexts.getDocument().replaceString(startOffset, tailOffset, suggestion);
-                                contexts.getEditor().getCaretModel().moveToOffset(startOffset + suggestion.length());
-                            })
-                            .withLookupString("code.i suggestion");
-                    // Mark as our suggestion
-                    builder.putUserData(CODE_I_SUGGESTION_KEY, Boolean.TRUE);
-                    // Very high priority
-                    resultSet.addElement(PrioritizedLookupElement.withPriority(builder, 10000.0));
-                }
-            }
-        });
-    }
-
-    private static boolean isInDebugSession(Project project) {
-        try {
-            DebuggerSession session = DebuggerManagerEx.getInstanceEx(project).getContext().getDebuggerSession();
-            return session != null && session.isPaused();
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-}
+Detect the file language (Java, Kotlin, Python) by extension and use language-specific PSI (Program Structure Interface) to extract the enclosing function for a given line in the source file.
+When collecting variables in the current stack frame, gather all local variables, object fields (Java/Kotlin), and attributes (Python) as shown in the IDE’s Variables pane.
+For exception collection, reliably detect exception objects by name (exception, e, throwable, exc_value, exc_type, exc_traceback) and/or type (containing “Exception” or “Throwable”), and extract their message and stack trace or traceback.
+Variable names and children should match what is displayed in the IDE’s debug window for each language.
+Use defensive coding practices so the plugin does not crash if a language is unsupported or a PSI class is missing.
+Add clear comments explaining key logic and language-specific handling.
+Ensure recursive collection of variable children (object fields/attributes), up to a safe depth limit.
+Avoid hard dependencies on PyCharm/Kotlin plugins, use reflection where necessary for PSI extraction.
+The resulting code must be robust, extensible for future languages, and should not throw errors in any JetBrains IDE.
