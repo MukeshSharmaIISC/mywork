@@ -1,24 +1,29 @@
-package org.dell;
+package org.samsung.aipp.aippintellij.debugAssist;
 
-import java.util.ArrayList;
 import java.util.List;
 
 public class SnapshotItem {
-    private final String name;
-    private final String value;
-    private final List<SnapshotItem> children;
+    private String name;
+    private String type;
+    private String value;
+    private List<SnapshotItem> children;
 
-    public SnapshotItem(String name, String value) {
+    public SnapshotItem(String name, String type, String value, List<SnapshotItem> children) {
         this.name = name;
+        this.type = type;
         this.value = value;
-        this.children = new ArrayList<>();
+        this.children = children;
     }
 
     public String getName() { return name; }
-    public String getValue() { return value; }
-    public List<SnapshotItem> getChildren() { return children; }
+    public void setName(String name) { this.name = name; }
 
-    public void addChild(SnapshotItem child) {
-        this.children.add(child);
-    }
+    public String getType() { return type; }
+    public void setType(String type) { this.type = type; }
+
+    public String getValue() { return value; }
+    public void setValue(String value) { this.value = value; }
+
+    public List<SnapshotItem> getChildren() { return children; }
+    public void setChildren(List<SnapshotItem> children) { this.children = children; }
 }
