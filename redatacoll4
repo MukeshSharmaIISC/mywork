@@ -1,0 +1,322 @@
+package org.samsung.aipp.aippintellij.debugAssist;
+
+import com.intellij.xdebugger.XDebugProcess;
+import com.intellij.xdebugger.XSourcePosition;
+import com.intellij.xdebugger.frame.*;
+import com.intellij.xdebugger.frame.presentation.XValuePresentation;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import javax.swing.*;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.function.Consumer;
+
+public class DebugDataCollector {
+
+    private static DebugDataCollector instance = new DebugDataCollector();
+
+    private List<SnapshotItem> latestSnapshot = new ArrayList<>();
+    private List<StackItem> latestStack = new ArrayList<>();
+    private ExceptionDetail latestException = null;
+
+    public static DebugDataCollector getInstance() {
+        return instance;
+    }
+
+    public List<SnapshotItem> getSnapshot() {
+        return latestSnapshot;
+    }
+
+    public List<StackItem> getCallStack() {
+        return latestStack;
+    }
+
+    public ExceptionDetail getExceptionDetail() {
+        return latestException;
+    }
+
+    public void clearDebugData() {
+        latestSnapshot.clear();
+        latestStack.clear();
+        latestException = null;
+    }
+
+    // ---------------- Stack Collection ----------------
+
+    public static void collectStackItems(XDebugProcess debugProcess, Consumer<ContextItem> callback) {
+        List<StackItem> stackItems = new ArrayList<>();
+        XExecutionStack stack = null;
+        try {
+            stack = debugProcess.getSession().getSuspendContext().getActiveExecutionStack();
+        } catch (Throwable t) {
+            // ignore
+        }
+        if (stack == null) {
+            callback.accept(new ContextItem(stackItems, false, ContextItem.Type.STACK));
+            return;
+        }
+        stack.computeStackFrames(0, new XExecutionStack.XStackFrameContainer() {
+            @Override
+            public void addStackFrames(@NotNull List<? extends XStackFrame> frames, boolean last) {
+                for (XStackFrame frame : frames) {
+                    XSourcePosition pos = frame.getSourcePosition();
+                    if (pos != null) {
+                        String file = pos.getFile().getPath();
+                        int line = pos.getLine() + 1;
+                        String language = pos.getFile().getExtension();
+                        String functionText = frame.getDisplayName();
+                        stackItems.add(new StackItem(file, line, functionText != null ? functionText : "", language));
+                    }
+                }
+                instance.latestStack = stackItems;
+                callback.accept(new ContextItem(stackItems, true, ContextItem.Type.STACK));
+            }
+            @Override public void errorOccurred(@NotNull String errorMessage) {
+                callback.accept(new ContextItem(stackItems, false, ContextItem.Type.STACK));
+            }
+        });
+    }
+
+    // ---------------- Snapshot Collection ----------------
+
+    public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
+        List<SnapshotItem> snapshotItems = new ArrayList<>();
+        if (currentStackFrame == null) {
+            callback.accept(new ContextItem(snapshotItems, false, ContextItem.Type.SNAPSHOT));
+            return;
+        }
+        currentStackFrame.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                for (int i = 0; i < children.size(); i++) {
+                    String varName = children.getName(i);
+                    XValue childValue = children.getValue(i);
+                    SnapshotItem item = collectVariableRecursive(varName, childValue, 0);
+                    if (item != null) snapshotItems.add(item);
+                }
+                instance.latestSnapshot = snapshotItems;
+                callback.accept(new ContextItem(snapshotItems, true, ContextItem.Type.SNAPSHOT));
+            }
+        });
+    }
+
+    // Recursively collects variable info (works for both Java & Python)
+    private static SnapshotItem collectVariableRecursive(String name, XValue value, int depth) {
+        if (depth > 10) return null; // Prevent deep recursion
+
+        final String[] type = {""};
+        final String[] valStr = {""};
+        final List<SnapshotItem> children = new ArrayList<>();
+
+        // Try to get type and value via presentation
+        value.computePresentation(new XValueNode() {
+            @Override
+            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                type[0] = presentation.getType();
+                valStr[0] = renderPresentationText(presentation);
+
+                // If value is empty for Python, try PyDebugValue reflection
+                if ((valStr[0] == null || valStr[0].isEmpty()) && isPyCharmEnvironment()) {
+                    String pyVal = tryReflectPyValueString(value);
+                    if (pyVal != null) valStr[0] = pyVal;
+                }
+            }
+        }, XValuePlace.TREE);
+
+        // Recursively collect children
+        value.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList childList, boolean last) {
+                for (int i = 0; i < childList.size(); i++) {
+                    XValue childVal = childList.getValue(i);
+                    String childName = childList.getName(i);
+                    SnapshotItem childItem = collectVariableRecursive(childName, childVal, depth + 1);
+                    if (childItem != null) children.add(childItem);
+                }
+            }
+        });
+
+        return new SnapshotItem(name, type[0], valStr[0], children);
+    }
+
+    // Helper to render value presentation as String
+    private static String renderPresentationText(XValuePresentation presentation) {
+        StringBuilder sb = new StringBuilder();
+        presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
+            @Override
+            public void renderValue(@NotNull String value) { sb.append(value); }
+            @Override
+            public void renderStringValue(@NotNull String value) { sb.append(value); }
+            @Override
+            public void renderNumericValue(@NotNull String value) { sb.append(value); }
+            @Override
+            public void renderKeywordValue(@NotNull String value) { sb.append(value); }
+            @Override
+            public void renderValue(@NotNull String value, @NotNull com.intellij.openapi.editor.colors.TextAttributesKey key) { sb.append(value); }
+            @Override
+            public void renderError(@NotNull String error) { sb.append(error); }
+        });
+        return sb.toString();
+    }
+
+    private static boolean isPyCharmEnvironment() {
+        try { Class.forName("com.jetbrains.python.debugger.PyDebugValue"); return true; }
+        catch (Throwable t) { return false; }
+    }
+
+    @Nullable
+    private static String tryReflectPyValueString(XValue xValue) {
+        try {
+            Object desc = null;
+            // Try to get descriptor for PyDebugValue
+            try {
+                if (xValue.getClass().getName().contains("PyDebugValue")) desc = xValue;
+                else {
+                    Method getDescriptor = xValue.getClass().getMethod("getDescriptor");
+                    desc = getDescriptor.invoke(xValue);
+                }
+            } catch (Throwable ignored) {}
+            if (desc == null) return null;
+            Class<?> pyCls = Class.forName("com.jetbrains.python.debugger.PyDebugValue");
+            Method getValue = pyCls.getMethod("getValue");
+            Object val = getValue.invoke(desc);
+            if (val != null) return val.toString();
+            return null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // ---------------- Exception Collection ----------------
+
+    public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
+        if (frame == null) {
+            callback.accept(new ContextItem(null, false, ContextItem.Type.EXCEPTION));
+            return;
+        }
+        frame.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                for (int i = 0; i < children.size(); i++) {
+                    String name = children.getName(i);
+                    XValue value = children.getValue(i);
+                    // For PyCharm: look for __exception__ tuple
+                    if ("__exception__".equals(name)) {
+                        processPyCharmExceptionTuple(value, frame, callback);
+                        return;
+                    }
+                    // For Java: look for typical exception variable
+                    if (name != null && name.toLowerCase().contains("exception")) {
+                        processJavaExceptionVariable(value, frame, callback);
+                        return;
+                    }
+                }
+                // If no exception found, return null.
+                callback.accept(new ContextItem(null, false, ContextItem.Type.EXCEPTION));
+            }
+        });
+    }
+
+    // For PyCharm: __exception__ is a tuple (type, exception object, traceback object)
+    private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
+        exceptionTuple.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList tupleChildren, boolean last) {
+                String type = null, message = null, stackTrace = null;
+                // tuple: [0]=type, [1]=exception object, [2]=traceback
+                XValue typeVal = tupleChildren.size() > 0 ? tupleChildren.getValue(0) : null;
+                if (typeVal != null) {
+                    typeVal.computePresentation(new XValueNode() {
+                        @Override
+                        public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                            type = renderPresentationText(presentation);
+                        }
+                    }, XValuePlace.TREE);
+                }
+                XValue exObj = tupleChildren.size() > 1 ? tupleChildren.getValue(1) : null;
+                if (exObj != null) {
+                    exObj.computeChildren(new XCompositeNode() {
+                        @Override
+                        public void addChildren(@NotNull XValueChildrenList exChildren, boolean last) {
+                            for (int j = 0; j < exChildren.size(); j++) {
+                                if ("args".equals(exChildren.getName(j))) {
+                                    XValue argsVal = exChildren.getValue(j);
+                                    argsVal.computePresentation(new XValueNode() {
+                                        @Override
+                                        public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                            message = renderPresentationText(presentation);
+                                        }
+                                    }, XValuePlace.TREE);
+                                }
+                            }
+                        }
+                    });
+                }
+                XValue tbObj = tupleChildren.size() > 2 ? tupleChildren.getValue(2) : null;
+                if (tbObj != null) {
+                    tbObj.computeChildren(new XCompositeNode() {
+                        @Override
+                        public void addChildren(@NotNull XValueChildrenList tbChildren, boolean last) {
+                            StringBuilder sb = new StringBuilder();
+                            for (int k = 0; k < tbChildren.size(); k++) {
+                                XValue tbChild = tbChildren.getValue(k);
+                                String tbName = tbChildren.getName(k);
+                                tbChild.computePresentation(new XValueNode() {
+                                    @Override
+                                    public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                        sb.append(tbName).append(": ").append(renderPresentationText(presentation)).append("\n");
+                                    }
+                                }, XValuePlace.TREE);
+                            }
+                            stackTrace = sb.toString();
+                        }
+                    });
+                }
+                ExceptionDetail detail = new ExceptionDetail(
+                        message, type, stackTrace,
+                        frame.getSourcePosition() != null ? frame.getSourcePosition().getFile().getPath() : "unknown",
+                        frame.getSourcePosition() != null ? frame.getSourcePosition().getLine() : -1
+                );
+                instance.latestException = detail;
+                callback.accept(new ContextItem(detail, true, ContextItem.Type.EXCEPTION));
+            }
+        });
+    }
+
+    // For Java: extract type and message from value presentation
+    private static void processJavaExceptionVariable(XValue value, XStackFrame frame, Consumer<ContextItem> callback) {
+        final String[] type = {""}, message = {""}, stackTrace = {""};
+        value.computePresentation(new XValueNode() {
+            @Override
+            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                type[0] = presentation.getType();
+                message[0] = renderPresentationText(presentation);
+            }
+        }, XValuePlace.TREE);
+
+        value.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                for (int i = 0; i < children.size(); i++) {
+                    String childName = children.getName(i);
+                    XValue childVal = children.getValue(i);
+                    if ("stackTrace".equalsIgnoreCase(childName)) {
+                        childVal.computePresentation(new XValueNode() {
+                            @Override
+                            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                stackTrace[0] = renderPresentationText(presentation);
+                            }
+                        }, XValuePlace.TREE);
+                    }
+                }
+            }
+        });
+
+        ExceptionDetail detail = new ExceptionDetail(message[0], type[0], stackTrace[0],
+                frame.getSourcePosition() != null ? frame.getSourcePosition().getFile().getPath() : "unknown",
+                frame.getSourcePosition() != null ? frame.getSourcePosition().getLine() : -1);
+        instance.latestException = detail;
+        callback.accept(new ContextItem(detail, true, ContextItem.Type.EXCEPTION));
+    }
+}
