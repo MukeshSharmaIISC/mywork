@@ -8,6 +8,7 @@ public class SnapshotItem {
     private String value;
     private List<SnapshotItem> children;
 
+    // Correct constructor
     public SnapshotItem(String name, String type, String value, List<SnapshotItem> children) {
         this.name = name;
         this.type = type;
