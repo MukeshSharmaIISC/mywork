@@ -1,21 +1,32 @@
-package org.dell;
+package org.samsung.aipp.aippintellij.debugAssist;
 
 public class ExceptionDetail {
-    private final String message;
-    private final String stackTrace;
-    private final int lineNumber;
+    private String message;
+    private String type;
+    private String stackTrace;
+    private String filePath;
+    private int lineNumber;
 
-    public ExceptionDetail(String message, String stackTrace, int lineNumber) {
+    public ExceptionDetail(String message, String type, String stackTrace, String filePath, int lineNumber) {
         this.message = message;
+        this.type = type;
         this.stackTrace = stackTrace;
+        this.filePath = filePath;
         this.lineNumber = lineNumber;
     }
 
     public String getMessage() { return message; }
-    public String getStackTrace() { return stackTrace; }
-    public int getLineNumber() { return lineNumber; }
+    public void setMessage(String message) { this.message = message; }
 
-    public boolean hasData() {
-        return message != null || stackTrace != null;
-    }
+    public String getType() { return type; }
+    public void setType(String type) { this.type = type; }
+
+    public String getStackTrace() { return stackTrace; }
+    public void setStackTrace(String stackTrace) { this.stackTrace = stackTrace; }
+
+    public String getFilePath() { return filePath; }
+    public void setFilePath(String filePath) { this.filePath = filePath; }
+
+    public int getLineNumber() { return lineNumber; }
+    public void setLineNumber(int lineNumber) { this.lineNumber = lineNumber; }
 }
