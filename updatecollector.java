@@ -1,6 +1,6 @@
 import com.google.gson.Gson;
-// removed: import com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider;
-// removed: import com.intellij.debugger.ui.impl.watch.ValueDescriptorImpl;
+// Note: avoid directly referencing Java-only debugger internals at runtime.
+// imports kept generic where possible
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.colors.TextAttributesKey;
@@ -29,6 +29,16 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.function.Consumer;
 
+/**
+ * DebugDataCollector
+ *
+ * Aggregates snapshot, stack, and exception information in a way that is safe to run
+ * both inside IntelliJ IDEA (Java PSI + Java debugger classes present) and PyCharm
+ * (Python debugger classes present, Java-PSI / Java-debugger internals potentially absent).
+ *
+ * This file uses reflection helper checks to avoid NoClassDefFoundError at runtime
+ * when Java-only classes are not available.
+ */
 public class DebugDataCollector {
 
     private static final Logger logger = Logger.getInstance(DebugDataCollector.class);
@@ -71,6 +81,8 @@ public class DebugDataCollector {
         latestException = null;
     }
 
+    // -------------------- Stack collection --------------------
+
     public static void collectStackItems(XDebugProcess debugProcess, Consumer<ContextItem> callback) {
         List<StackItem> stackItems = new ArrayList<>();
         XExecutionStack stack = debugProcess.getSession().getSuspendContext().getActiveExecutionStack();
@@ -89,8 +101,8 @@ public class DebugDataCollector {
                     if (pos != null) {
                         String file = pos.getFile().getPath();
                         int line = pos.getLine() + 1;
-                        String language = pos.getFile().getExtension(),
-                               functionText = extractEnclosingFunction(debugProcess.getSession().getProject(), pos.getFile(), pos.getLine());
+                        String language = pos.getFile().getExtension();
+                        String functionText = extractEnclosingFunctionSafe(debugProcess.getSession().getProject(), pos.getFile(), pos.getLine());
                         stackItems.add(new StackItem(file, line, functionText != null ? functionText : "", language));
                     }
                 }
@@ -111,6 +123,8 @@ public class DebugDataCollector {
             }
         });
     }
+
+    // -------------------- Children / snapshot collection --------------------
 
     private static void collectChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) {
@@ -141,29 +155,17 @@ public class DebugDataCollector {
                                 StringBuilder sb = new StringBuilder();
                                 presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
                                     @Override
-                                    public void renderValue(@Nullable String value) {
-                                        sb.append(value);
-                                    }
+                                    public void renderValue(@Nullable String value) { sb.append(value); }
                                     @Override
-                                    public void renderStringValue(@Nullable String value) {
-                                        sb.append(value);
-                                    }
+                                    public void renderStringValue(@Nullable String value) { sb.append(value); }
                                     @Override
-                                    public void renderNumericValue(@Nullable String value) {
-                                        sb.append(value);
-                                    }
+                                    public void renderNumericValue(@Nullable String value) { sb.append(value); }
                                     @Override
-                                    public void renderKeywordValue(@Nullable String value) {
-                                        sb.append(value);
-                                    }
+                                    public void renderKeywordValue(@Nullable String value) { sb.append(value); }
                                     @Override
-                                    public void renderValue(@Nullable String value, @NotNull TextAttributesKey key) {
-                                        sb.append(value);
-                                    }
+                                    public void renderValue(@Nullable String value, @NotNull TextAttributesKey key) { sb.append(value); }
                                     @Override
-                                    public void renderStringValue(@Nullable String value, @Nullable String ref, int unused) {
-                                        sb.append(value);
-                                    }
+                                    public void renderStringValue(@Nullable String value, @Nullable String ref, int unused) { sb.append(value); }
                                     @Override
                                     public void renderComment(@NotNull String comment) {}
                                     @Override
@@ -174,6 +176,7 @@ public class DebugDataCollector {
 
                                 childItem.value = sb.toString();
 
+                                // Fallback for PyCharm where presentation may be empty: try reflection
                                 if ((childItem.value == null || childItem.value.isEmpty()) && isPyCharmEnvironment()) {
                                     String pyRendered = tryReflectPyValueString(childValue);
                                     if (pyRendered != null) {
@@ -341,6 +344,8 @@ public class DebugDataCollector {
         });
     }
 
+    // -------------------- Exception collection --------------------
+
     private static class ExceptionState {
         private final AtomicReference<State> state = new AtomicReference<>(State.INIT);
 
@@ -430,9 +435,8 @@ public class DebugDataCollector {
                 boolean nameSuggests = (name != null && name.toLowerCase().contains("exception"));
 
                 boolean pyDescriptor = false;
-                Object desc = null;
                 if (isNodeDescriptorProvider(value)) {
-                    desc = getDescriptorFromNodeDescriptorProvider(value);
+                    Object desc = getDescriptorFromNodeDescriptorProvider(value);
                     pyDescriptor = isPyDebugValue(desc);
                 }
 
@@ -527,47 +531,23 @@ public class DebugDataCollector {
                         StringBuilder sb = new StringBuilder();
                         presentation.renderValue(new XValuePresentation.XValueTextRenderer() {
                             @Override
-                            public void renderValue(@NotNull String value) {
-                                sb.append(value);
-                            }
-
+                            public void renderValue(@NotNull String value) { sb.append(value); }
                             @Override
-                            public void renderStringValue(@NotNull String value) {
-                                sb.append(value);
-                            }
-
+                            public void renderStringValue(@NotNull String value) { sb.append(value); }
                             @Override
-                            public void renderNumericValue(@NotNull String value) {
-                                sb.append(value);
-                            }
-
+                            public void renderNumericValue(@NotNull String value) { sb.append(value); }
                             @Override
-                            public void renderKeywordValue(@NotNull String value) {
-                                sb.append(value);
-                            }
-
+                            public void renderKeywordValue(@NotNull String value) { sb.append(value); }
                             @Override
-                            public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) {
-                                sb.append(value);
-                            }
-
+                            public void renderValue(@NotNull String value, @NotNull TextAttributesKey key) { sb.append(value); }
                             @Override
-                            public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) {
-                                sb.append(value);
-                            }
-
+                            public void renderStringValue(@NotNull String value, @Nullable String ref, int unused) { sb.append(value); }
                             @Override
                             public void renderComment(@NotNull String comment) { }
-
                             @Override
-                            public void renderSpecialSymbol(@NotNull String symbol) {
-                                sb.append(symbol);
-                            }
-
+                            public void renderSpecialSymbol(@NotNull String symbol) { sb.append(symbol); }
                             @Override
-                            public void renderError(@NotNull String error) {
-                                sb.append(error);
-                            }
+                            public void renderError(@NotNull String error) { sb.append(error); }
                         });
                         return sb.toString();
                     }
@@ -638,38 +618,107 @@ public class DebugDataCollector {
         });
     }
 
+    // -------------------- Safe enclosing function extraction --------------------
+    /**
+     * Replaces direct usage of PsiMethod/PyFunction with reflection-based parent traversal.
+     * This avoids NoClassDefFoundError in PyCharm (where Java PSI classes may be absent).
+     *
+     * Returns a clipped function text (prefix+suffix around the target line) when possible,
+     * otherwise returns filename:line or null.
+     */
     @Nullable
-    private static String extractEnclosingFunction(@NotNull Project project, @NotNull VirtualFile file, int line) {
+    private static String extractEnclosingFunctionSafe(@NotNull Project project, @NotNull VirtualFile file, int line) {
         return com.intellij.openapi.application.ApplicationManager.getApplication().runReadAction((com.intellij.openapi.util.Computable<String>) () -> {
             PsiFile psiFile = PsiManager.getInstance(project).findFile(file);
             if (psiFile == null) {
                 logger.warn("PSI file not found for: " + file.getPath());
                 return null;
             }
+
             Document document = FileDocumentManager.getInstance().getDocument(file);
             if (document == null || line >= document.getLineCount()) {
                 logger.warn("Invalid document or line number for file: " + file.getPath());
                 return null;
             }
+
             int offset = document.getLineStartOffset(line);
             PsiElement elementAt = psiFile.findElementAt(offset);
             if (elementAt == null) {
                 logger.warn("No PSI element at line: " + line + " in file: " + file.getPath());
                 return null;
             }
-            PsiElement functionElement = PsiTreeUtil.getParentOfType(elementAt, PsiMethod.class, PsiLambdaExpression.class);
+
+            // Walk parents safely, checking for Java PsiMethod or Python PyFunction via reflection.
+            PsiElement functionElement = null;
+            PsiElement walker = elementAt;
+            while (walker != null) {
+                // Try Java PsiMethod
+                try {
+                    Class<?> psiMethodCls = Class.forName("com.intellij.psi.PsiMethod");
+                    if (psiMethodCls.isInstance(walker)) {
+                        functionElement = walker;
+                        break;
+                    }
+                } catch (ClassNotFoundException ignored) {
+                    // Java PSI not available -> skip
+                } catch (Throwable t) {
+                    // Unexpected reflection error -> log and continue
+                    logger.debug("Reflection error checking PsiMethod: " + t.getMessage());
+                }
+
+                // Try Python PyFunction
+                try {
+                    Class<?> pyFuncCls = Class.forName("com.jetbrains.python.psi.PyFunction");
+                    if (pyFuncCls.isInstance(walker)) {
+                        functionElement = walker;
+                        break;
+                    }
+                } catch (ClassNotFoundException ignored) {
+                    // PyFunction class not present -> skip
+                } catch (Throwable t) {
+                    logger.debug("Reflection error checking PyFunction: " + t.getMessage());
+                }
+
+                // Try PsiLambdaExpression (name may vary across platform builds) - fallback by class simple name
+                try {
+                    String simple = walker.getClass().getSimpleName();
+                    if (simple != null && (simple.contains("Lambda") || simple.contains("LambdaExpression"))) {
+                        functionElement = walker;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+
+                // Move up
+                walker = walker.getParent();
+            }
+
             if (functionElement == null) {
+                // No function-like parent found; return null so caller can decide fallback behaviour.
                 return null;
             }
 
-            String fullText = functionElement.getText();
-            String[] lines = fullText.split("\n");
+            // Get full text of the found element safely via getText()
+            String fullText;
+            try {
+                fullText = functionElement.getText();
+            } catch (Throwable t) {
+                logger.warn("Unable to get text of function element: " + t.getMessage());
+                return null;
+            }
 
+            String[] lines = fullText.split("\n");
             if (lines.length <= Constants.ENCLOSING_FUNCTION_PREFIX_LINES + Constants.ENCLOSING_FUNCTION_SUFFIX_LINES) {
                 return fullText;
             }
 
-            int functionStartLine = document.getLineNumber(functionElement.getTextRange().getStartOffset());
+            // Compute function start line relative to file
+            int functionStartLine;
+            try {
+                functionStartLine = document.getLineNumber(functionElement.getTextRange().getStartOffset());
+            } catch (Throwable t) {
+                logger.warn("Unable to compute function start line: " + t.getMessage());
+                return fullText;
+            }
             int targetLineInFunction = line - functionStartLine;
 
             int startLine = Math.max(targetLineInFunction - Constants.ENCLOSING_FUNCTION_PREFIX_LINES, 0);
@@ -683,8 +732,11 @@ public class DebugDataCollector {
         });
     }
 
-    // ======= Helpers for PyCharm compatibility (reflection) =======
+    // -------------------- Reflection helpers --------------------
 
+    /**
+     * Returns true if PyCharm's PyDebugValue is available in runtime.
+     */
     private static boolean isPyCharmEnvironment() {
         try {
             Class.forName("com.jetbrains.python.debugger.PyDebugValue");
@@ -871,7 +923,7 @@ public class DebugDataCollector {
         return rendered[0];
     }
 
-    // ======= Utility to normalize IntelliJ and PyCharm values (requested) =======
+    // -------------------- Normalization helpers requested by you --------------------
 
     @SuppressWarnings("unchecked")
     public static void handleDebugValue(Object valueObj, Map<String, String> variables) {
