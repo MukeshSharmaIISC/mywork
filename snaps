@@ -1,0 +1,24 @@
+package org.dell;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class SnapshotItem {
+    private final String name;
+    private final String value;
+    private final List<SnapshotItem> children;
+
+    public SnapshotItem(String name, String value) {
+        this.name = name;
+        this.value = value;
+        this.children = new ArrayList<>();
+    }
+
+    public String getName() { return name; }
+    public String getValue() { return value; }
+    public List<SnapshotItem> getChildren() { return children; }
+
+    public void addChild(SnapshotItem child) {
+        this.children.add(child);
+    }
+}
