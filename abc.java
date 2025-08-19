@@ -1,3 +1,60 @@
+Goal:
+Refactor DebugDataCollector.java so that snapshot (variable) and exception collection logic works correctly in JetBrains IDEs (PyCharm, IntelliJ IDEA, etc.) for Python, Java, and Kotlin code.
+
+Step-by-step Plan:
+
+1. Language Detection
+
+Detect the language of the current file or debug context (Python, Java, Kotlin) using file extension or IDE APIs.
+2. Snapshot (Variable) Collection
+
+For the current stack frame, collect all variables shown in the IDE’s debug window.
+For each variable, record:
+Variable name
+Type (as displayed by the IDE, e.g., (int), (str), (float))
+Value (as displayed)
+For object variables (lists, dicts, custom objects):
+Recursively collect children, including:
+For lists/arrays: each indexed element
+For dicts/maps: each key-value pair
+For objects: all attributes/fields
+Special fields (e.g., __len__ in Python)
+Maintain the correct nested structure for children.
+3. Exception Collection
+
+Detect exception variables in the current frame:
+For Python/PyCharm: Look for special variables like __exception__, exception, etc.
+For Java/Kotlin: Look for variables named e, exception, throwable, etc.
+For any exception variable found:
+Extract type/class name
+Extract message (use the appropriate field or attribute, e.g., args in Python)
+Extract traceback/stacktrace details:
+For Python: recursively traverse traceback attributes like tb_frame, tb_lineno, tb_next
+For Java/Kotlin: extract stacktrace elements as shown in the debug window
+Recursively collect children/attributes of the exception object
+4. Robustness and Extensibility
+
+Ensure logic does not assume hardcoded structures; inspect types and attributes dynamically.
+Add comments explaining how the code adapts to different debug window layouts and future changes.
+Make the code robust against missing attributes or unexpected variable structures.
+5. Output
+
+Return the collected snapshot and exception details in a structured, nested format matching the IDE's debug window.
+Request:
+Please provide the updated code for DebugDataCollector.java following this plan, with clear comments and robust logic for all three languages and IDEs.
+
+
+
+
+
+
+
+
+
+
+
+
+
 Refactor DebugDataCollector.java for Python (PyCharm) so that variable and exception extraction logic exactly matches how details are shown in the PyCharm debug window.
 
 Snapshot Extraction Requirements:
