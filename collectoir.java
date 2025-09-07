@@ -164,7 +164,7 @@ public class DebugDataCollector {
 
                         if (isPyCharmEnvironment()) {
                             logger.debug("Trying PyCharm-specific collection for variable: " + varName);
-                            collectPyCharmValueAndChildren(childValue, mutableItem, 0, () -> {
+                            collectPyCharmValueAndChildren(currentStackFrame, childValue, mutableItem, 0, () -> {
                                 if (pending.decrementAndGet() == 0) complete();
                             });
                         } else {
@@ -202,64 +202,120 @@ public class DebugDataCollector {
     }
 
     /**
-     * PyCharm: Recursively collects child values using PyDebugValue reflection.
-     * Fallbacks to standard collectValueAndChildren when reflection doesn't produce usable children.
+     * PyCharm: Recursively collects child values using multiple approaches:
+     * 1. Reflection via PyDebugValue
+     * 2. Standard XValue presentation/children
+     * 3. Python expression evaluation (repr(var)) via XDebuggerEvaluator
      */
-    private static void collectPyCharmValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
+    private static void collectPyCharmValueAndChildren(XStackFrame frame, XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
         try {
             Object pyDebugValue = tryGetPyDebugValue(value);
+            boolean usedReflection = false;
             if (pyDebugValue != null) {
                 String name = tryGetPyName(pyDebugValue);
                 String val = tryGetPyValue(pyDebugValue);
                 String type = tryGetPyType(pyDebugValue);
                 if (name != null) parent.name = name;
-                if (val != null) parent.value = val;
+                if (val != null && !"unavailable".equals(val)) parent.value = val;
                 if (type != null) parent.type = type;
+                usedReflection = true;
 
                 List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
-
-                logger.debug("PyCharm reflection: " + parent.name + " type=" + parent.type + " value=" + parent.value
-                        + " children count=" + (pyChildren == null ? 0 : pyChildren.size()));
-
-                // If reflection yields no children (or non-usable), FALL BACK to XValue path
-                if (pyChildren == null || pyChildren.isEmpty()) {
-                    logger.debug("PyCharm reflection yielded no children for: " + parent.name + " — falling back to XValue traversal");
-                    collectValueAndChildren(value, parent, currentDepth, onComplete);
-                    return;
-                }
-
-                AtomicInteger pending = new AtomicInteger(pyChildren.size());
-                for (Object child : pyChildren) {
-                    String childName = tryGetPyName(child);
-                    String childType = tryGetPyType(child);
-                    String childValueStr = tryGetPyValue(child);
-
-                    MutableSnapshotItem childItem = new MutableSnapshotItem(
+                if (pyChildren != null && !pyChildren.isEmpty()) {
+                    AtomicInteger pending = new AtomicInteger(pyChildren.size());
+                    for (Object child : pyChildren) {
+                        String childName = tryGetPyName(child);
+                        String childType = tryGetPyType(child);
+                        String childValueStr = tryGetPyValue(child);
+                        MutableSnapshotItem childItem = new MutableSnapshotItem(
                             childName != null ? childName : "unknown",
                             childType != null ? childType : "unknown",
                             childValueStr != null ? childValueStr : "unavailable",
                             "Field"
-                    );
-                    parent.children.add(childItem);
+                        );
+                        parent.children.add(childItem);
 
-                    logger.debug("PyCharm child: " + childItem.name + " type=" + childItem.type + " value=" + childItem.value);
-
-                    if (child instanceof XValue) {
-                        collectPyCharmValueAndChildren((XValue) child, childItem, currentDepth + 1, () -> {
+                        // Recursively collect children if child is XValue
+                        if (child instanceof XValue) {
+                            collectPyCharmValueAndChildren(frame, (XValue) child, childItem, currentDepth + 1, () -> {
+                                if (pending.decrementAndGet() == 0) onComplete.run();
+                            });
+                        } else {
                             if (pending.decrementAndGet() == 0) onComplete.run();
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Fallback: Native XValue presentation/children
+            value.computePresentation(new XValueNode() {
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                    String rendered = renderPresentationText(presentation);
+                    if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && rendered != null && !rendered.isEmpty())
+                        parent.value = rendered;
+
+                    if ("unavailable".equals(parent.value) || parent.value == null || parent.value.isEmpty()) {
+                        // Last resort: Evaluate Python expression in debugger, e.g., repr(var)
+                        if (frame.getEvaluator() != null && parent.name != null) {
+                            logger.debug("Trying Python eval: repr(" + parent.name + ")");
+                            frame.getEvaluator().evaluate("repr(" + parent.name + ")", new XDebuggerEvaluator.XEvaluationCallback() {
+                                @Override
+                                public void evaluated(@NotNull XValue result) {
+                                    result.computePresentation(new XValueNode() {
+                                        @Override
+                                        public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                            String evalValue = renderPresentationText(presentation);
+                                            if (evalValue != null && !evalValue.isEmpty())
+                                                parent.value = evalValue;
+                                        }
+                                        @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                                        @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+                                    }, XValuePlace.TREE);
+                                }
+                                @Override
+                                public void errorOccurred(@NotNull String errorMessage) {
+                                    parent.value = "Unavailable (eval error): " + errorMessage;
+                                    logger.warn("Python eval failed for " + parent.name + ": " + errorMessage);
+                                }
+                            }, null);
+                        }
+                    }
+
+                    if (hasChildren) {
+                        value.computeChildren(new XCompositeNode() {
+                            @Override
+                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                AtomicInteger pending = new AtomicInteger(children.size());
+                                for (int i = 0; i < children.size(); i++) {
+                                    String childName = children.getName(i);
+                                    XValue childValue = children.getValue(i);
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
+                                    collectPyCharmValueAndChildren(frame, childValue, childItem, currentDepth + 1, () -> {
+                                        if (pending.decrementAndGet() == 0) onComplete.run();
+                                    });
+                                }
+                            }
+                            @Override public void tooManyChildren(int remaining) { onComplete.run(); }
+                            @Override public void setAlreadySorted(boolean alreadySorted) {}
+                            @Override public void setErrorMessage(@NotNull String errorMessage) { onComplete.run(); }
+                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { onComplete.run(); }
+                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
                         });
                     } else {
-                        if (pending.decrementAndGet() == 0) onComplete.run();
+                        onComplete.run();
                     }
                 }
-            } else {
-                logger.debug("No pyDebugValue via reflection for: " + parent.name + " — falling back to XValue traversal");
-                collectValueAndChildren(value, parent, currentDepth, onComplete);
-            }
+                @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+            }, XValuePlace.TREE);
+
         } catch (Throwable t) {
-            logger.warn("collectPyCharmValueAndChildren failed: " + t.getMessage());
             parent.value = "Value not available";
+            logger.warn("collectPyCharmValueAndChildren failed: " + t.getMessage());
             onComplete.run();
         }
     }
@@ -448,9 +504,8 @@ public class DebugDataCollector {
         });
     }
 
-    /**
-     * Processes PyCharm exception tuple, falling back to reflection and presentation if tuple shape is unexpected.
-     */
+    // --- Exception helpers (unchanged from previous) ---
+
     private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
         // Try to compute children; if not 3 members, fallback to reflection-based extraction.
         final AtomicBoolean usedFallback = new AtomicBoolean(false);
@@ -527,8 +582,6 @@ public class DebugDataCollector {
             }
         }
     }
-
-    // --- Remaining helpers (unchanged from your previous code) ---
 
     private static String extractTypeString(XValue value) {
         final String[] type = {"unknown"};
