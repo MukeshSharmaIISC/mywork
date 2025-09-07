@@ -1,49 +1,77 @@
-package org.samsung.aipp.aippintellij.debugAssist;
+private static String extractTypeString(XValue value) { 
 
-import com.intellij.openapi.project.Project;
-import com.intellij.xdebugger.frame.XStackFrame;
-import com.intellij.xdebugger.XDebugProcess;
+    final String[] outType = {"unknown"}; 
 
-/**
- * Factory class to provide the correct DebugDataCollector implementation
- * based on the current IDE (PyCharm, etc.) or file extension (.java, .kt, .py).
- */
-public class DebugDataCollectorFactory {
+    try { 
 
-    /**
-     * Returns the appropriate DebugDataCollectorInterface instance for the current context.
-     */
-    public static DebugDataCollectorInterface getCollector(Project project, XStackFrame frame, XDebugProcess process) {
-        // IDE detection: PyCharm
-        if (isPyCharm()) {
-            return DebugDataCollectorPython.getInstance();
-        }
+        value.computePresentation(new XValueNode() { 
 
-        // File extension detection
-        if (frame != null && frame.getSourcePosition() != null) {
-            String ext = frame.getSourcePosition().getFile().getExtension();
-            if (ext != null) {
-                switch (ext.toLowerCase()) {
-                    case "py":
-                        return DebugDataCollectorPython.getInstance();
-                    case "kt":
-                        return DebugDataCollectorKotlin.getInstance();
-                    case "java":
-                        return DebugDataCollectorJava.getInstance();
-                }
-            }
-        }
+            @Override 
 
-        // Default: Java collector
-        return DebugDataCollectorJava.getInstance();
-    }
+            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) { 
 
-    private static boolean isPyCharm() {
-        try {
-            Class.forName("com.jetbrains.python.debugger.PyDebugValue");
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-}
+                if (presentation.getType() != null) outType[0] = presentation.getType(); 
+
+            } 
+
+            // rename the parameter so it doesn't shadow outType 
+
+            @Override 
+
+            public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) { 
+
+                if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr; 
+
+            } 
+
+            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {} 
+
+        }, XValuePlace.TREE); 
+
+    } catch (Throwable ignored) {} 
+
+    return outType[0]; 
+
+} 
+
+  
+
+private static String getExceptionType(XValue value) { 
+
+    final String[] outType = {"unknown"}; 
+
+    try { 
+
+        value.computePresentation(new XValueNode() { 
+
+            @Override 
+
+            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) { 
+
+                String typeStr = presentation.getType(); 
+
+                if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr; 
+
+            } 
+
+            // rename param to avoid shadowing 
+
+            @Override 
+
+            public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) { 
+
+                if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr; 
+
+            } 
+
+            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {} 
+
+        }, XValuePlace.TREE); 
+
+    } catch (Throwable t) { logger.debug("getExceptionType failed: " + t.getMessage()); } 
+
+    return outType[0]; 
+
+} 
+
+ 
