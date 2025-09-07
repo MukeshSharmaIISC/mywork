@@ -18,13 +18,15 @@ import org.samsung.aipp.aippintellij.util.Constants;
 import javax.swing.*;
 import java.io.FileWriter;
 import java.io.PrintWriter;
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.Date;
 
 public class DebugDataCollector {
 
@@ -241,7 +243,7 @@ public class DebugDataCollector {
                     try {
                         Object pyDebugValue = tryGetPyDebugValue(value);
                         if (pyDebugValue != null) {
-                            logger.debug("collectPyCharm: found pyDebugValue descriptor for '" + parent.name + "': " + pyDebugValue.getClass().getName());
+                            logger.debug("collectPyCharm: found pyDebugValue descriptor for '" + parent.name + "': " + safeClassName(pyDebugValue));
                             String reflName = tryGetPyName(pyDebugValue);
                             String reflVal  = tryGetPyValue(pyDebugValue);
                             String reflType = tryGetPyType(pyDebugValue);
@@ -249,6 +251,7 @@ public class DebugDataCollector {
                             if (reflVal != null && !reflVal.isEmpty() && !"unavailable".equals(reflVal)) parent.value = reflVal;
                             if (reflType != null) parent.type = reflType;
 
+                            // FIRST: well-known getChildren()/getValue().getChildren() paths (fast)
                             List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
                             if (pyChildren != null && !pyChildren.isEmpty()) {
                                 logger.debug("collectPyCharm: descriptor provided " + pyChildren.size() + " children for '" + parent.name + "'");
@@ -258,7 +261,6 @@ public class DebugDataCollector {
                                         // If it's an XValue already -> recurse properly
                                         if (childObj instanceof XValue) {
                                             XValue childX = (XValue) childObj;
-                                            // Name unknown until presentation/reflection resolves it; create placeholder
                                             MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
                                             parent.children.add(childItem);
                                             collectPyCharmValueAndChildren(frame, childX, childItem, currentDepth + 1, () -> {
@@ -266,27 +268,42 @@ public class DebugDataCollector {
                                             });
                                         } else {
                                             // Descriptor-only child (not XValue): best-effort leaf using reflection
-                                            String cName = tryGetPyName(childObj);
-                                            String cType = tryGetPyType(childObj);
-                                            String cVal  = tryGetPyValue(childObj);
-                                            MutableSnapshotItem childItem = new MutableSnapshotItem(
-                                                    cName != null ? cName : "unknown",
-                                                    cType != null ? cType : "unknown",
-                                                    cVal  != null ? cVal  : "unavailable",
-                                                    "Field"
-                                            );
+                                            MutableSnapshotItem childItem = createSnapshotFromDescriptor(childObj);
                                             parent.children.add(childItem);
                                             if (pending.decrementAndGet() == 0) finishOnce.run();
                                         }
                                     } catch (Throwable inner) {
-                                        // ensure pending decremented even on error
                                         if (pending.decrementAndGet() == 0) finishOnce.run();
                                     }
                                 }
                                 return; // descriptor children handled (or scheduled) — exit
-                            } else {
-                                logger.debug("collectPyCharm: descriptor returned no usable children for '" + parent.name + "'");
                             }
+
+                            // SECOND: try to find children by inspecting methods/fields (more aggressive)
+                            List<Object> reflectiveChildren = inspectDescriptorForChildren(pyDebugValue);
+                            if (reflectiveChildren != null && !reflectiveChildren.isEmpty()) {
+                                logger.debug("collectPyCharm: reflectiveChildren count=" + reflectiveChildren.size() + " for '" + parent.name + "'");
+                                AtomicInteger pending = new AtomicInteger(reflectiveChildren.size());
+                                for (Object childObj : reflectiveChildren) {
+                                    try {
+                                        MutableSnapshotItem childItem = (childObj instanceof XValue)
+                                                ? new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field")
+                                                : createSnapshotFromDescriptor(childObj);
+                                        parent.children.add(childItem);
+                                        if (childObj instanceof XValue) {
+                                            collectPyCharmValueAndChildren(frame, (XValue) childObj, childItem, currentDepth + 1, () -> {
+                                                if (pending.decrementAndGet() == 0) finishOnce.run();
+                                            });
+                                        } else {
+                                            if (pending.decrementAndGet() == 0) finishOnce.run();
+                                        }
+                                    } catch (Throwable inner) {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
+                                    }
+                                }
+                                return;
+                            }
+
                         } else {
                             logger.debug("collectPyCharm: no pyDebugValue descriptor for '" + parent.name + "'");
                         }
@@ -346,7 +363,7 @@ public class DebugDataCollector {
                                     } catch (Throwable e) {
                                         logger.debug("collectPyCharm: eval presentation parse failed: " + e.getMessage());
                                     } finally {
-                                        // After this simple eval attempt, if still no value, try more aggressive evals and/or dump descriptor
+                                        // aggressive evals + dump if still empty
                                         postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                                     }
                                 }
@@ -422,21 +439,10 @@ public class DebugDataCollector {
             return;
         }
 
-        // Build the concrete expressions by formatting templates with varName (escape as needed)
+        // Build the concrete expressions by replacing %s placeholders
         List<String> exprs = new ArrayList<>();
         for (String tmpl : exprTemplates) {
-            try {
-                // use simple replace of %s placeholders to support templates with two placeholders
-                int count = tmpl.length() - tmpl.replace("%s", "").length();
-                if (count >= 2) {
-                    exprs.add(tmpl.replace("%s", varName));
-                } else {
-                    exprs.add(tmpl.replace("%s", varName));
-                }
-            } catch (Throwable t) {
-                // fallback: replace placeholder manually
-                exprs.add(tmpl.replace("%s", varName));
-            }
+            exprs.add(tmpl.replace("%s", varName));
         }
 
         // recursive helper index-based
@@ -493,6 +499,8 @@ public class DebugDataCollector {
      * Attempts to get PyCharm children, using several reflection strategies and broad checks.
      * Returns a list which may contain XValue instances or descriptor objects.
      * If none found, returns empty list.
+     *
+     * This version tries several common method names and shapes, but if none found it returns empty.
      */
     private static List<Object> tryGetPyChildren(Object pyDebugValue) {
         try {
@@ -502,18 +510,14 @@ public class DebugDataCollector {
             try {
                 Method getChildren = pyDebugValue.getClass().getMethod("getChildren");
                 Object res = getChildren.invoke(pyDebugValue);
-                if (res instanceof List) {
-                    List<?> raw = (List<?>) res;
-                    List<Object> out = new ArrayList<>();
-                    for (Object o : raw) if (o != null) out.add(o);
-                    if (!out.isEmpty()) {
-                        logger.debug("tryGetPyChildren: got " + out.size() + " children via getChildren()");
-                        return out;
-                    }
+                List<Object> out = listFromPossibleCollection(res);
+                if (!out.isEmpty()) {
+                    logger.debug("tryGetPyChildren: got " + out.size() + " children via getChildren()");
+                    return out;
                 }
             } catch (NoSuchMethodException ignored) {}
 
-            // 2) some descriptors return getValue() which then has getChildren()
+            // 2) getValue().getChildren()
             try {
                 Method getValue = pyDebugValue.getClass().getMethod("getValue");
                 Object val = getValue.invoke(pyDebugValue);
@@ -521,46 +525,166 @@ public class DebugDataCollector {
                     try {
                         Method getChildren2 = val.getClass().getMethod("getChildren");
                         Object childrenObj2 = getChildren2.invoke(val);
-                        if (childrenObj2 instanceof List) {
-                            List<?> raw = (List<?>) childrenObj2;
-                            List<Object> out = new ArrayList<>();
-                            for (Object o : raw) if (o != null) out.add(o);
-                            if (!out.isEmpty()) {
-                                logger.debug("tryGetPyChildren: got " + out.size() + " children via getValue().getChildren()");
-                                return out;
-                            }
+                        List<Object> out = listFromPossibleCollection(childrenObj2);
+                        if (!out.isEmpty()) {
+                            logger.debug("tryGetPyChildren: got " + out.size() + " children via getValue().getChildren()");
+                            return out;
                         }
                     } catch (NoSuchMethodException ignored) {}
                 }
             } catch (NoSuchMethodException ignored) {}
 
-            // 3) Some descriptors expose 'getTreeChildren' or similar — try generic attempt (best-effort)
-            try {
-                Method[] methods = pyDebugValue.getClass().getMethods();
-                for (Method m : methods) {
-                    String name = m.getName().toLowerCase();
-                    if (name.contains("children") && m.getParameterCount() == 0 && List.class.isAssignableFrom(m.getReturnType())) {
-                        try {
-                            Object got = m.invoke(pyDebugValue);
-                            if (got instanceof List) {
-                                List<?> raw = (List<?>) got;
-                                List<Object> out = new ArrayList<>();
-                                for (Object o : raw) if (o != null) out.add(o);
-                                if (!out.isEmpty()) {
-                                    logger.debug("tryGetPyChildren: got " + out.size() + " children via " + m.getName());
-                                    return out;
-                                }
-                            }
-                        } catch (Throwable ex) { /* ignore per-method */ }
+        } catch (Throwable t) {
+            logger.debug("tryGetPyChildren failed early: " + t.getMessage());
+        }
+        // Nothing found via common paths
+        return Collections.emptyList();
+    }
+
+    /**
+     * Inspect arbitrary descriptor object for iterable/map/array fields or zero-arg methods returning collection-like values.
+     * Returns list of raw child objects (may be descriptors or XValue instances).
+     */
+    private static List<Object> inspectDescriptorForChildren(Object descriptor) {
+        if (descriptor == null) return Collections.emptyList();
+        List<Object> out = new ArrayList<>();
+        try {
+            // 1) Inspect declared fields (including private) for collections/arrays/maps
+            Field[] fields = descriptor.getClass().getDeclaredFields();
+            for (Field f : fields) {
+                try {
+                    if (Modifier.isStatic(f.getModifiers())) continue;
+                    f.setAccessible(true);
+                    Object val = f.get(descriptor);
+                    List<Object> list = listFromPossibleCollection(val);
+                    if (!list.isEmpty()) {
+                        out.addAll(list);
+                        logger.debug("inspectDescriptorForChildren: found children via field " + f.getName());
+                        // continue scanning to collect more children
                     }
-                }
-            } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {}
+            }
+
+            // 2) Inspect zero-arg methods that return iterable/map/array
+            Method[] methods = descriptor.getClass().getMethods();
+            for (Method m : methods) {
+                try {
+                    if (m.getParameterCount() != 0) continue;
+                    String name = m.getName().toLowerCase();
+                    // prefer methods with 'children', 'items', 'values', 'elements' etc in name to reduce noise
+                    if (!(name.contains("children") || name.contains("items") || name.contains("values") || name.contains("elements"))) continue;
+                    Object res = m.invoke(descriptor);
+                    List<Object> list = listFromPossibleCollection(res);
+                    if (!list.isEmpty()) {
+                        out.addAll(list);
+                        logger.debug("inspectDescriptorForChildren: found children via method " + m.getName());
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            // 3) Last resort: some descriptors expose a 'toArray' or 'asList' methods
+            for (Method m : methods) {
+                try {
+                    if (m.getParameterCount() != 0) continue;
+                    String name = m.getName().toLowerCase();
+                    if (name.contains("toarray") || name.contains("aslist")) {
+                        Object res = m.invoke(descriptor);
+                        List<Object> list = listFromPossibleCollection(res);
+                        if (!list.isEmpty()) {
+                            out.addAll(list);
+                            logger.debug("inspectDescriptorForChildren: found children via fallback method " + m.getName());
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
 
         } catch (Throwable t) {
-            logger.debug("tryGetPyChildren failed: " + t.getMessage());
+            logger.debug("inspectDescriptorForChildren failed: " + t.getMessage());
         }
-        logger.debug("tryGetPyChildren: no usable children found");
-        return Collections.emptyList();
+        return out;
+    }
+
+    /**
+     * Convert an object that may be a Collection, Iterable, Map, array, or single element into a List<Object>.
+     */
+    private static List<Object> listFromPossibleCollection(Object obj) {
+        List<Object> out = new ArrayList<>();
+        try {
+            if (obj == null) return out;
+            if (obj instanceof List) {
+                out.addAll((List<?>) obj);
+                return out;
+            }
+            if (obj instanceof Collection) {
+                out.addAll((Collection<?>) obj);
+                return out;
+            }
+            if (obj instanceof Map) {
+                out.addAll(((Map<?, ?>) obj).entrySet());
+                return out;
+            }
+            if (obj instanceof Iterable) {
+                for (Object o : (Iterable<?>) obj) out.add(o);
+                return out;
+            }
+            if (obj.getClass().isArray()) {
+                int len = Array.getLength(obj);
+                for (int i = 0; i < len; i++) out.add(Array.get(obj, i));
+                return out;
+            }
+            // If it's a single descriptor object, return as a single-element list
+            out.add(obj);
+            return out;
+        } catch (Throwable t) {
+            logger.debug("listFromPossibleCollection failed: " + t.getMessage());
+            return out;
+        }
+    }
+
+    /**
+     * Build a MutableSnapshotItem from an arbitrary descriptor object by reflecting getName/getValue/getType and/or toString.
+     * This is the key helper that ensures descriptor-only children appear in the snapshot even when they're not XValue.
+     */
+    private static MutableSnapshotItem createSnapshotFromDescriptor(Object desc) {
+        try {
+            String name = null, type = null, value = null;
+            try {
+                Method m = desc.getClass().getMethod("getName");
+                Object r = m.invoke(desc);
+                if (r != null) name = r.toString();
+            } catch (Throwable ignored) {}
+            try {
+                Method m = desc.getClass().getMethod("getType");
+                Object r = m.invoke(desc);
+                if (r != null) type = r.toString();
+            } catch (Throwable ignored) {}
+            try {
+                Method m = desc.getClass().getMethod("getValue");
+                Object r = m.invoke(desc);
+                if (r != null) value = r.toString();
+            } catch (Throwable ignored) {}
+            if ((value == null || value.isEmpty()) && desc != null) {
+                try { value = desc.toString(); } catch (Throwable ignored) {}
+            }
+            if (name == null || name.isEmpty()) name = "unknown";
+            if (type == null || type.isEmpty()) type = "unknown";
+            if (value == null || value.isEmpty()) value = "unavailable";
+            MutableSnapshotItem msi = new MutableSnapshotItem(name, type, value, "Field");
+
+            // Try to collect nested children from this descriptor (best-effort)
+            List<Object> nested = tryGetPyChildren(desc);
+            if (nested == null || nested.isEmpty()) nested = inspectDescriptorForChildren(desc);
+            if (nested != null && !nested.isEmpty()) {
+                for (Object c : nested) {
+                    MutableSnapshotItem child = createSnapshotFromDescriptor(c);
+                    msi.children.add(child);
+                }
+            }
+            return msi;
+        } catch (Throwable t) {
+            logger.debug("createSnapshotFromDescriptor failed: " + t.getMessage());
+            return new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
+        }
     }
 
     private static Object tryGetPyDebugValue(XValue xValue) {
@@ -572,7 +696,7 @@ public class DebugDataCollector {
                 if (xValue instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) {
                     Object desc = ((com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) xValue).getDescriptor();
                     if (desc != null) {
-                        logger.debug("tryGetPyDebugValue: got descriptor via NodeDescriptorProvider: " + desc.getClass().getName());
+                        logger.debug("tryGetPyDebugValue: got descriptor via NodeDescriptorProvider: " + safeClassName(desc));
                         return desc;
                     }
                 }
@@ -585,7 +709,7 @@ public class DebugDataCollector {
                     Method gd = nodeProviderClass.getMethod("getDescriptor");
                     Object desc = gd.invoke(xValue);
                     if (desc != null) {
-                        logger.debug("tryGetPyDebugValue: got descriptor via reflection getDescriptor(): " + desc.getClass().getName());
+                        logger.debug("tryGetPyDebugValue: got descriptor via reflection getDescriptor(): " + safeClassName(desc));
                         return desc;
                     }
                 }
@@ -594,7 +718,7 @@ public class DebugDataCollector {
             // 3) Sometimes the xValue itself *is* a PyDebugValue (rare) — check by class name
             try {
                 if (isPyDebugValue(xValue)) {
-                    logger.debug("tryGetPyDebugValue: xValue is PyDebugValue instance");
+                    logger.debug("tryGetPyDebugValue: xValue is PyDebugValue instance: " + safeClassName(xValue));
                     return xValue;
                 }
             } catch (Throwable ignored) {}
@@ -673,6 +797,18 @@ public class DebugDataCollector {
                             }
                         }
                     }
+                    pw.println("--- Fields (declared) ---");
+                    Field[] fields = desc.getClass().getDeclaredFields();
+                    for (Field f : fields) {
+                        try {
+                            f.setAccessible(true);
+                            Object fv = f.get(desc);
+                            String fval = (fv == null) ? "null" : fv.getClass().getName() + ":" + safeToString(fv, 200);
+                            pw.println(f.getName() + " -> " + fval);
+                        } catch (Throwable tt) {
+                            pw.println(f.getName() + " -> (access failed: " + tt.getMessage() + ")");
+                        }
+                    }
                 }
                 pw.flush();
             }
@@ -680,6 +816,15 @@ public class DebugDataCollector {
         } catch (Throwable t) {
             logger.warn("dumpDescriptorToFile failed: " + t.getMessage());
         }
+    }
+
+    private static String safeClassName(Object o) { return o == null ? "null" : o.getClass().getName(); }
+    private static String safeToString(Object o, int max) {
+        try {
+            String s = String.valueOf(o);
+            if (s.length() > max) return s.substring(0, max) + "...";
+            return s;
+        } catch (Throwable t) { return "(toString failed)"; }
     }
 
     /**
@@ -939,7 +1084,6 @@ public class DebugDataCollector {
             boolean typeSuggests = type != null && type.toLowerCase().contains("exception");
             boolean descriptorSuggests = false;
             try {
-                Method getDescriptorMethod = null;
                 if (value instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) {
                     Object desc = ((com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) value).getDescriptor();
                     descriptorSuggests = isPyDebugValue(desc);
@@ -1191,3 +1335,4 @@ public class DebugDataCollector {
         }
     }
 }
+
