@@ -61,7 +61,6 @@ public class DebugDataCollector {
         latestException = null;
     }
 
-    // ------------------ PyCharm Detection ------------------
     private static boolean isPyCharmEnvironment() {
         if (cachedIsPyCharm != null) return cachedIsPyCharm;
         try {
@@ -83,7 +82,6 @@ public class DebugDataCollector {
         }
     }
 
-    // ------------------ Stack Collection ------------------
     public static void collectStackItems(XDebugProcess debugProcess, Consumer<ContextItem> callback) {
         List<StackItem> stackItems = new ArrayList<>();
         XExecutionStack stack = null;
@@ -139,7 +137,6 @@ public class DebugDataCollector {
         }
     }
 
-    // ------------------ Variable & Snapshot Collection ------------------
     public static void collectSnapshot(XStackFrame currentStackFrame, Consumer<ContextItem> callback) {
         List<MutableSnapshotItem> snapshotItems = new ArrayList<>();
         AtomicInteger debuggerCalls = new AtomicInteger(0);
@@ -164,7 +161,7 @@ public class DebugDataCollector {
                         snapshotItems.add(mutableItem);
                         debuggerCalls.incrementAndGet();
 
-                        collectValueAndChildren(childValue, mutableItem, 0, () -> {
+                        collectSnapshotValueAndChildren(childValue, mutableItem, 0, () -> {
                             if (pending.decrementAndGet() == 0) complete();
                         });
                     }
@@ -174,8 +171,7 @@ public class DebugDataCollector {
                     List<SnapshotItem> result = new ArrayList<>();
                     for (MutableSnapshotItem item : snapshotItems) {
                         if (isPyCharmEnvironment()) {
-                            String pretty = prettyPrintPythonValue(item);
-                            if (pretty != null && !pretty.isEmpty()) item.value = pretty;
+                            item.value = prettyPrintPythonValue(item);
                         }
                         result.add(item.toSnapshotItem());
                     }
@@ -200,48 +196,10 @@ public class DebugDataCollector {
         }
     }
 
-    /**
-     * Pretty print Python values as lists or dicts for readability.
-     */
-    private static String prettyPrintPythonValue(MutableSnapshotItem item) {
-        // Handle dict
-        if ("dict".equalsIgnoreCase(item.type)
-                || (item.value != null && item.value.startsWith("{") && item.value.endsWith("}"))) {
-            StringBuilder sb = new StringBuilder("{");
-            for (int i = 0; i < item.children.size(); i++) {
-                MutableSnapshotItem child = item.children.get(i);
-                sb.append(child.name).append(": ").append(prettyPrintPythonValue(child));
-                if (i < item.children.size() - 1) sb.append(", ");
-            }
-            sb.append("}");
-            return sb.toString();
-        }
-        // Handle list/tuple
-        if ("list".equalsIgnoreCase(item.type) || "tuple".equalsIgnoreCase(item.type)
-                || (item.value != null && item.value.startsWith("[") && item.value.endsWith("]"))) {
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < item.children.size(); i++) {
-                MutableSnapshotItem child = item.children.get(i);
-                sb.append(prettyPrintPythonValue(child));
-                if (i < item.children.size() - 1) sb.append(", ");
-            }
-            sb.append("]");
-            return sb.toString();
-        }
-        // Primitives
-        if (item.value != null && !"unavailable".equalsIgnoreCase(item.value)) {
-            return item.value;
-        }
-        // Fallback
-        return "";
-    }
-
-    /**
-     * Recursively collects value and children for both Java and PyCharm variables.
-     */
-    private static void collectValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
+    private static void collectSnapshotValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
         try {
+            // Try PyCharm-specific reflection
             if (isPyCharmEnvironment()) {
                 Object pyDebugValue = tryGetPyDebugValue(value);
                 if (pyDebugValue != null) {
@@ -251,14 +209,14 @@ public class DebugDataCollector {
                     if (pyVal != null) parent.value = pyVal;
                 }
             }
-
             value.computePresentation(new XValueNode() {
                 @Override
                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                     try {
                         if (presentation.getType() != null) parent.type = presentation.getType();
                         String rendered = renderPresentationText(presentation);
-                        if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && rendered != null && !rendered.isEmpty())
+                        if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) &&
+                                rendered != null && !rendered.isEmpty())
                             parent.value = rendered;
                     } catch (Exception e) {
                         parent.value = "Value not available";
@@ -274,7 +232,7 @@ public class DebugDataCollector {
                                         XValue childValue = children.getValue(i);
                                         MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
                                         parent.children.add(childItem);
-                                        collectValueAndChildren(childValue, childItem, currentDepth + 1, () -> {
+                                        collectSnapshotValueAndChildren(childValue, childItem, currentDepth + 1, () -> {
                                             if (pending.decrementAndGet() == 0) onComplete.run();
                                         });
                                     }
@@ -299,7 +257,39 @@ public class DebugDataCollector {
         }
     }
 
-    // --- Helper reflection functions for PyCharm ---
+    private static String prettyPrintPythonValue(MutableSnapshotItem item) {
+        // Dict
+        if ("dict".equalsIgnoreCase(item.type)
+                || (item.value != null && item.value.startsWith("{") && item.value.endsWith("}"))) {
+            StringBuilder sb = new StringBuilder("{");
+            for (int i = 0; i < item.children.size(); i++) {
+                MutableSnapshotItem child = item.children.get(i);
+                sb.append(child.name).append(": ").append(prettyPrintPythonValue(child));
+                if (i < item.children.size() - 1) sb.append(", ");
+            }
+            sb.append("}");
+            return sb.toString();
+        }
+        // List/tuple
+        if ("list".equalsIgnoreCase(item.type) || "tuple".equalsIgnoreCase(item.type)
+                || (item.value != null && item.value.startsWith("[") && item.value.endsWith("]"))) {
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < item.children.size(); i++) {
+                MutableSnapshotItem child = item.children.get(i);
+                sb.append(prettyPrintPythonValue(child));
+                if (i < item.children.size() - 1) sb.append(", ");
+            }
+            sb.append("]");
+            return sb.toString();
+        }
+        // Primitives
+        if (item.value != null && !"unavailable".equalsIgnoreCase(item.value)) {
+            return item.value;
+        }
+        // Fallback
+        return "";
+    }
+
     private static Object tryGetPyDebugValue(XValue xValue) {
         try {
             if (xValue instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider)
@@ -332,53 +322,43 @@ public class DebugDataCollector {
         return null;
     }
 
-    // ------------------ Exception Detection & Collection ------------------
     public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
-        try {
-            frame.computeChildren(new XCompositeNode() {
-                @Override
-                public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                    boolean pyExceptionDetected = false;
+        frame.computeChildren(new XCompositeNode() {
+            @Override
+            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                boolean foundException = false;
+                for (int i = 0; i < children.size(); i++) {
+                    String name = children.getName(i);
+                    XValue value = children.getValue(i);
+                    if (isPyCharmEnvironment() && "__exception__".equals(name)) {
+                        foundException = true;
+                        processPyCharmExceptionTuple(value, frame, callback);
+                        break;
+                    } else if (isExceptionCandidateSafe(name, value)) {
+                        foundException = true;
+                        processExceptionSafe(value, frame, callback);
+                        break;
+                    }
+                }
+                // If not found and PyCharm, fallback search for __exception__ by name
+                if (!foundException && isPyCharmEnvironment()) {
                     for (int i = 0; i < children.size(); i++) {
-                        String name = children.getName(i);
-                        XValue value = children.getValue(i);
-                        if (isPyCharmEnvironment() && "__exception__".equals(name)) {
-                            pyExceptionDetected = true;
-                            processPyCharmExceptionTuple(value, frame, callback);
-                            break;
-                        } else if (isExceptionCandidateSafe(name, value)) {
-                            processExceptionSafe(value, frame, callback);
+                        if ("__exception__".equals(children.getName(i))) {
+                            processPyCharmExceptionTuple(children.getValue(i), frame, callback);
                             return;
                         }
                     }
-                    // If running in PyCharm, force exception detection from "__exception__" variable.
-                    if (isPyCharmEnvironment() && !pyExceptionDetected) {
-                        // Try to fallback: look for variable named "__exception__"
-                        try {
-                            for (int i = 0; i < children.size(); i++) {
-                                String name = children.getName(i);
-                                if ("__exception__".equals(name)) {
-                                    processPyCharmExceptionTuple(children.getValue(i), frame, callback);
-                                    return;
-                                }
-                            }
-                        } catch (Exception e) {
-                            logger.warn("Failed to fallback to __exception__ detection: " + e.getMessage());
-                        }
-                    }
-                    // fallback: nothing looked like exception -> collect snapshot
+                }
+                if (!foundException) {
                     collectSnapshot(frame, callback);
                 }
-                @Override public void tooManyChildren(int remaining) {}
-                @Override public void setAlreadySorted(boolean alreadySorted) {}
-                @Override public void setErrorMessage(@NotNull String errorMessage) {}
-                @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
-                @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
-            });
-        } catch (Throwable t) {
-            logger.warn("collectException outer error: " + t.getMessage());
-            try { collectSnapshot(frame, callback); } catch (Throwable ignored) {}
-        }
+            }
+            @Override public void tooManyChildren(int remaining) {}
+            @Override public void setAlreadySorted(boolean alreadySorted) {}
+            @Override public void setErrorMessage(@NotNull String errorMessage) {}
+            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
+            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+        });
     }
 
     private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
@@ -404,6 +384,8 @@ public class DebugDataCollector {
             @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
         });
     }
+
+    // --- All exception helpers below are unchanged from your original file ---
 
     private static String extractTypeString(XValue value) {
         final String[] type = {"unknown"};
