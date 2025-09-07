@@ -69,6 +69,7 @@ public class DebugDataCollector {
         } catch (Throwable t) {
             cachedIsPyCharm = false;
         }
+        logger.debug("isPyCharmEnvironment detected: " + cachedIsPyCharm);
         return cachedIsPyCharm;
     }
 
@@ -162,6 +163,7 @@ public class DebugDataCollector {
                         debuggerCalls.incrementAndGet();
 
                         if (isPyCharmEnvironment()) {
+                            logger.debug("Trying PyCharm-specific collection for variable: " + varName);
                             collectPyCharmValueAndChildren(childValue, mutableItem, 0, () -> {
                                 if (pending.decrementAndGet() == 0) complete();
                             });
@@ -197,6 +199,156 @@ public class DebugDataCollector {
             instance.latestSnapshot.addAll(result);
             callback.accept(new ContextItem(result, false, ContextItem.Type.SNAPSHOT));
         }
+    }
+
+    /**
+     * PyCharm: Recursively collects child values using PyDebugValue reflection.
+     * Fallbacks to standard collectValueAndChildren when reflection doesn't produce usable children.
+     */
+    private static void collectPyCharmValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
+        if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
+        try {
+            Object pyDebugValue = tryGetPyDebugValue(value);
+            if (pyDebugValue != null) {
+                String name = tryGetPyName(pyDebugValue);
+                String val = tryGetPyValue(pyDebugValue);
+                String type = tryGetPyType(pyDebugValue);
+                if (name != null) parent.name = name;
+                if (val != null) parent.value = val;
+                if (type != null) parent.type = type;
+
+                List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
+
+                logger.debug("PyCharm reflection: " + parent.name + " type=" + parent.type + " value=" + parent.value
+                        + " children count=" + (pyChildren == null ? 0 : pyChildren.size()));
+
+                // If reflection yields no children (or non-usable), FALL BACK to XValue path
+                if (pyChildren == null || pyChildren.isEmpty()) {
+                    logger.debug("PyCharm reflection yielded no children for: " + parent.name + " — falling back to XValue traversal");
+                    collectValueAndChildren(value, parent, currentDepth, onComplete);
+                    return;
+                }
+
+                AtomicInteger pending = new AtomicInteger(pyChildren.size());
+                for (Object child : pyChildren) {
+                    String childName = tryGetPyName(child);
+                    String childType = tryGetPyType(child);
+                    String childValueStr = tryGetPyValue(child);
+
+                    MutableSnapshotItem childItem = new MutableSnapshotItem(
+                            childName != null ? childName : "unknown",
+                            childType != null ? childType : "unknown",
+                            childValueStr != null ? childValueStr : "unavailable",
+                            "Field"
+                    );
+                    parent.children.add(childItem);
+
+                    logger.debug("PyCharm child: " + childItem.name + " type=" + childItem.type + " value=" + childItem.value);
+
+                    if (child instanceof XValue) {
+                        collectPyCharmValueAndChildren((XValue) child, childItem, currentDepth + 1, () -> {
+                            if (pending.decrementAndGet() == 0) onComplete.run();
+                        });
+                    } else {
+                        if (pending.decrementAndGet() == 0) onComplete.run();
+                    }
+                }
+            } else {
+                logger.debug("No pyDebugValue via reflection for: " + parent.name + " — falling back to XValue traversal");
+                collectValueAndChildren(value, parent, currentDepth, onComplete);
+            }
+        } catch (Throwable t) {
+            logger.warn("collectPyCharmValueAndChildren failed: " + t.getMessage());
+            parent.value = "Value not available";
+            onComplete.run();
+        }
+    }
+
+    /**
+     * Attempts to get PyCharm children, using several reflection strategies and broad checks.
+     */
+    private static List<Object> tryGetPyChildren(Object pyDebugValue) {
+        try {
+            Method getChildren = null;
+            try {
+                getChildren = pyDebugValue.getClass().getMethod("getChildren");
+            } catch (NoSuchMethodException ignored) {}
+            if (getChildren != null) {
+                Object childrenObj = getChildren.invoke(pyDebugValue);
+                if (childrenObj instanceof List) {
+                    List<?> raw = (List<?>) childrenObj;
+                    List<Object> out = new ArrayList<>();
+                    for (Object o : raw) if (o != null) out.add(o);
+                    if (!out.isEmpty()) {
+                        logger.debug("tryGetPyChildren: got " + out.size() + " children via getChildren()");
+                        return out;
+                    }
+                }
+            }
+
+            try {
+                Method getValue = pyDebugValue.getClass().getMethod("getValue");
+                Object val = getValue.invoke(pyDebugValue);
+                if (val != null) {
+                    try {
+                        Method getChildren2 = val.getClass().getMethod("getChildren");
+                        Object childrenObj2 = getChildren2.invoke(val);
+                        if (childrenObj2 instanceof List) {
+                            List<?> raw = (List<?>) childrenObj2;
+                            List<Object> out = new ArrayList<>();
+                            for (Object o : raw) if (o != null) out.add(o);
+                            if (!out.isEmpty()) {
+                                logger.debug("tryGetPyChildren: got " + out.size() + " children via getValue().getChildren()");
+                                return out;
+                            }
+                        }
+                    } catch (NoSuchMethodException ignored) {}
+                }
+            } catch (NoSuchMethodException ignored) {}
+
+        } catch (Throwable t) {
+            logger.warn("tryGetPyChildren failed: " + t.getMessage());
+        }
+        logger.debug("tryGetPyChildren: no usable children found");
+        return Collections.emptyList();
+    }
+
+    private static Object tryGetPyDebugValue(XValue xValue) {
+        try {
+            if (xValue instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider)
+                return ((com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) xValue).getDescriptor();
+            Class<?> nodeProviderClass = Class.forName("com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider");
+            if (nodeProviderClass.isInstance(xValue)) {
+                Method gd = nodeProviderClass.getMethod("getDescriptor");
+                return gd.invoke(xValue);
+            }
+            if (isPyDebugValue(xValue)) return xValue;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+    private static String tryGetPyName(Object pyDebugValue) {
+        try {
+            Method getName = pyDebugValue.getClass().getMethod("getName");
+            Object name = getName.invoke(pyDebugValue);
+            return name != null ? name.toString() : null;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+    private static String tryGetPyValue(Object pyDebugValue) {
+        try {
+            Method getValue = pyDebugValue.getClass().getMethod("getValue");
+            Object val = getValue.invoke(pyDebugValue);
+            return val != null ? val.toString() : null;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+    private static String tryGetPyType(Object pyDebugValue) {
+        try {
+            Method getType = pyDebugValue.getClass().getMethod("getType");
+            Object type = getType.invoke(pyDebugValue);
+            return type != null ? type.toString() : null;
+        } catch (Throwable ignored) {}
+        return "unknown";
     }
 
     /**
@@ -247,100 +399,10 @@ public class DebugDataCollector {
                 @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) {
+            logger.warn("collectValueAndChildren failed: " + t.getMessage());
             parent.value = "Value not available";
             onComplete.run();
         }
-    }
-
-    /**
-     * PyCharm: Recursively collects child values using PyDebugValue reflection.
-     */
-    private static void collectPyCharmValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
-        if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
-        try {
-            Object pyDebugValue = tryGetPyDebugValue(value);
-            if (pyDebugValue != null) {
-                parent.name = tryGetPyName(pyDebugValue);
-                parent.value = tryGetPyValue(pyDebugValue);
-                parent.type = tryGetPyType(pyDebugValue);
-
-                List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
-                if (pyChildren != null && !pyChildren.isEmpty()) {
-                    AtomicInteger pending = new AtomicInteger(pyChildren.size());
-                    for (Object child : pyChildren) {
-                        MutableSnapshotItem childItem = new MutableSnapshotItem(
-                            tryGetPyName(child), tryGetPyType(child), tryGetPyValue(child), "Field"
-                        );
-                        parent.children.add(childItem);
-
-                        // Recursively collect children (must wrap child as XValue if possible)
-                        if (child instanceof XValue) {
-                            collectPyCharmValueAndChildren((XValue) child, childItem, currentDepth + 1, () -> {
-                                if (pending.decrementAndGet() == 0) onComplete.run();
-                            });
-                        } else {
-                            // If child is not an XValue, just run onComplete
-                            if (pending.decrementAndGet() == 0) onComplete.run();
-                        }
-                    }
-                } else {
-                    onComplete.run();
-                }
-            } else {
-                // Fallback to standard Java traversal if reflection fails
-                collectValueAndChildren(value, parent, currentDepth, onComplete);
-            }
-        } catch (Throwable t) {
-            parent.value = "Value not available";
-            onComplete.run();
-        }
-    }
-
-    // PyCharm reflection helpers
-    private static Object tryGetPyDebugValue(XValue xValue) {
-        try {
-            if (xValue instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider)
-                return ((com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) xValue).getDescriptor();
-            Class<?> nodeProviderClass = Class.forName("com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider");
-            if (nodeProviderClass.isInstance(xValue)) {
-                Method gd = nodeProviderClass.getMethod("getDescriptor");
-                return gd.invoke(xValue);
-            }
-            if (isPyDebugValue(xValue)) return xValue;
-        } catch (Throwable ignored) {}
-        return null;
-    }
-    private static String tryGetPyName(Object pyDebugValue) {
-        try {
-            Method getName = pyDebugValue.getClass().getMethod("getName");
-            Object name = getName.invoke(pyDebugValue);
-            return name != null ? name.toString() : null;
-        } catch (Throwable ignored) {}
-        return null;
-    }
-    private static String tryGetPyValue(Object pyDebugValue) {
-        try {
-            Method getValue = pyDebugValue.getClass().getMethod("getValue");
-            Object val = getValue.invoke(pyDebugValue);
-            return val != null ? val.toString() : null;
-        } catch (Throwable ignored) {}
-        return null;
-    }
-    private static String tryGetPyType(Object pyDebugValue) {
-        try {
-            Method getType = pyDebugValue.getClass().getMethod("getType");
-            Object type = getType.invoke(pyDebugValue);
-            return type != null ? type.toString() : null;
-        } catch (Throwable ignored) {}
-        return "unknown";
-    }
-    private static List<Object> tryGetPyChildren(Object pyDebugValue) {
-        try {
-            Method getChildren = pyDebugValue.getClass().getMethod("getChildren");
-            Object childrenObj = getChildren.invoke(pyDebugValue);
-            if (childrenObj instanceof List) return (List<Object>) childrenObj;
-        } catch (Throwable ignored) {}
-        return Collections.emptyList();
     }
 
     public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
@@ -353,10 +415,12 @@ public class DebugDataCollector {
                     XValue value = children.getValue(i);
                     if (isPyCharmEnvironment() && "__exception__".equals(name)) {
                         foundException = true;
+                        logger.debug("Found __exception__ in PyCharm frame: " + name);
                         processPyCharmExceptionTuple(value, frame, callback);
                         break;
                     } else if (isExceptionCandidateSafe(name, value)) {
                         foundException = true;
+                        logger.debug("Found Java-style exception in frame: " + name);
                         processExceptionSafe(value, frame, callback);
                         break;
                     }
@@ -365,12 +429,14 @@ public class DebugDataCollector {
                 if (!foundException && isPyCharmEnvironment()) {
                     for (int i = 0; i < children.size(); i++) {
                         if ("__exception__".equals(children.getName(i))) {
+                            logger.debug("Fallback: Found __exception__ by name in PyCharm frame");
                             processPyCharmExceptionTuple(children.getValue(i), frame, callback);
                             return;
                         }
                     }
                 }
                 if (!foundException) {
+                    logger.debug("No exception detected; collecting snapshot instead.");
                     collectSnapshot(frame, callback);
                 }
             }
@@ -382,29 +448,87 @@ public class DebugDataCollector {
         });
     }
 
+    /**
+     * Processes PyCharm exception tuple, falling back to reflection and presentation if tuple shape is unexpected.
+     */
     private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
-        exceptionTuple.computeChildren(new XCompositeNode() {
-            @Override
-            public void addChildren(@NotNull XValueChildrenList tupleChildren, boolean last) {
-                String type = null, message = null, stackTrace = null;
-                if (tupleChildren.size() == 3) {
-                    type = extractTypeString(tupleChildren.getValue(0));
-                    message = extractExceptionMessage(tupleChildren.getValue(1));
-                    stackTrace = extractTraceback(tupleChildren.getValue(2));
+        // Try to compute children; if not 3 members, fallback to reflection-based extraction.
+        final AtomicBoolean usedFallback = new AtomicBoolean(false);
+        try {
+            exceptionTuple.computeChildren(new XCompositeNode() {
+                @Override
+                public void addChildren(@NotNull XValueChildrenList tupleChildren, boolean last) {
+                    String type = null, message = null, stackTrace = null;
+                    if (tupleChildren.size() == 3) {
+                        logger.debug("PyCharm exception tuple has expected size=3");
+                        type = extractTypeString(tupleChildren.getValue(0));
+                        message = extractExceptionMessage(tupleChildren.getValue(1));
+                        stackTrace = extractTraceback(tupleChildren.getValue(2));
+                    } else {
+                        logger.warn("PyCharm exception tuple has unexpected size=" + tupleChildren.size() + "; will fallback.");
+                        usedFallback.set(true);
+                    }
+
+                    if (usedFallback.get()) {
+                        Object py = tryGetPyDebugValue(exceptionTuple);
+                        if (py != null) {
+                            String t = tryGetPyType(py);
+                            String m = tryGetPyValue(py);
+                            String st = null;
+                            List<Object> children = tryGetPyChildren(py);
+                            if (children != null) {
+                                StringBuilder tbSb = new StringBuilder();
+                                for (Object c : children) {
+                                    String cn = tryGetPyName(c);
+                                    if ("__traceback__".equals(cn) || (cn != null && cn.toLowerCase().contains("trace"))) {
+                                        String tv = tryGetPyValue(c);
+                                        if (tv != null) tbSb.append(tv).append("\n");
+                                    }
+                                }
+                                if (tbSb.length() > 0) st = tbSb.toString();
+                            }
+                            type = (t != null ? t : type);
+                            message = (m != null ? m : message);
+                            stackTrace = (st != null ? st : stackTrace);
+                        } else {
+                            String base = extractBaseMessageSafe(null, exceptionTuple);
+                            message = (message == null || message.isEmpty()) ? base : message;
+                        }
+                    }
+
+                    logger.debug("Exception detail: type=" + type + " message=" + message + " stackTrace=" + (stackTrace != null ? stackTrace.substring(0, Math.min(200, stackTrace.length())) : "null"));
+                    ExceptionDetail detail = new ExceptionDetail(message, type, stackTrace,
+                            frame.getSourcePosition() != null ? frame.getSourcePosition().getFile().getPath() : "unknown",
+                            frame.getSourcePosition() != null ? frame.getSourcePosition().getLine() : -1);
+                    instance.latestException = detail;
+                    callback.accept(new ContextItem(detail, true, ContextItem.Type.EXCEPTION));
                 }
-                ExceptionDetail detail = new ExceptionDetail(message, type, stackTrace,
+
+                @Override public void tooManyChildren(int remaining) {}
+                @Override public void setAlreadySorted(boolean alreadySorted) {}
+                @Override public void setErrorMessage(@NotNull String errorMessage) {}
+                @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+            });
+        } catch (Throwable t) {
+            logger.warn("processPyCharmExceptionTuple failed: " + t.getMessage());
+            try {
+                Object py = tryGetPyDebugValue(exceptionTuple);
+                String type = py != null ? tryGetPyType(py) : "unknown";
+                String message = py != null ? tryGetPyValue(py) : extractBaseMessageSafe(null, exceptionTuple);
+                ExceptionDetail detail = new ExceptionDetail(message, type, null,
                         frame.getSourcePosition() != null ? frame.getSourcePosition().getFile().getPath() : "unknown",
                         frame.getSourcePosition() != null ? frame.getSourcePosition().getLine() : -1);
                 instance.latestException = detail;
                 callback.accept(new ContextItem(detail, true, ContextItem.Type.EXCEPTION));
+            } catch (Throwable ignore) {
+                logger.warn("Final fallback in processPyCharmExceptionTuple failed; collecting snapshot.");
+                collectSnapshot(frame, callback);
             }
-            @Override public void tooManyChildren(int remaining) {}
-            @Override public void setAlreadySorted(boolean alreadySorted) {}
-            @Override public void setErrorMessage(@NotNull String errorMessage) {}
-            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) {}
-            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
-        });
+        }
     }
+
+    // --- Remaining helpers (unchanged from your previous code) ---
 
     private static String extractTypeString(XValue value) {
         final String[] type = {"unknown"};
