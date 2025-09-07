@@ -1317,6 +1317,19 @@ public class DebugDataCollector {
             LOG.warn("dumpDescriptorToFile failed: " + t.getMessage());
         }
     }
+    @Nullable
+private static String extractEnclosingFunctionSafe(XDebugProcess debugProcess, XSourcePosition pos) {
+    try {
+        Project project = debugProcess.getSession().getProject();
+        VirtualFile file = pos.getFile();
+        int line = pos.getLine();
+        return extractEnclosingFunctionReflective(project, file, line);
+    } catch (Throwable t) {
+        LOG.debug("extractEnclosingFunctionSafe failed: " + t.getMessage());
+        return null;
+    }
+}
+
 
     private static String safeClassName(Object o) { return o == null ? "null" : o.getClass().getName(); }
     private static String safeToString(Object o, int max) {
