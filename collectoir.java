@@ -28,6 +28,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
+/**
+ * DebugDataCollector - full file. Key fix: implement both XValueNode.setPresentation overloads
+ * (XValuePresentation and (String type, String value)) so PyCharm presentations are not lost.
+ */
 public class DebugDataCollector {
 
     private static final Logger logger = Logger.getInstance(DebugDataCollector.class);
@@ -45,21 +49,13 @@ public class DebugDataCollector {
                 : "[DebugDataCollector] Running IntelliJ debugger environment.");
     }
 
-    public static DebugDataCollector getInstance() {
-        return instance;
-    }
+    public static DebugDataCollector getInstance() { return instance; }
 
-    public List<SnapshotItem> getSnapshot() {
-        return new ArrayList<>(latestSnapshot);
-    }
+    public List<SnapshotItem> getSnapshot() { return new ArrayList<>(latestSnapshot); }
 
-    public List<StackItem> getCallStack() {
-        return new ArrayList<>(latestStack);
-    }
+    public List<StackItem> getCallStack() { return new ArrayList<>(latestStack); }
 
-    public ExceptionDetail getExceptionDetail() {
-        return latestException;
-    }
+    public ExceptionDetail getExceptionDetail() { return latestException; }
 
     public void clearDebugData() {
         latestSnapshot.clear();
@@ -84,9 +80,7 @@ public class DebugDataCollector {
         try {
             Class<?> cls = Class.forName("com.jetbrains.python.debugger.PyDebugValue");
             return cls.isInstance(o);
-        } catch (Throwable t) {
-            return false;
-        }
+        } catch (Throwable t) { return false; }
     }
 
     public static void collectStackItems(XDebugProcess debugProcess, Consumer<ContextItem> callback) {
@@ -183,9 +177,7 @@ public class DebugDataCollector {
 
                 private void complete() {
                     List<SnapshotItem> result = new ArrayList<>();
-                    for (MutableSnapshotItem item : snapshotItems) {
-                        result.add(item.toSnapshotItem());
-                    }
+                    for (MutableSnapshotItem item : snapshotItems) result.add(item.toSnapshotItem());
                     instance.latestSnapshot.clear();
                     instance.latestSnapshot.addAll(result);
                     callback.accept(new ContextItem(result, true, ContextItem.Type.SNAPSHOT));
@@ -208,13 +200,8 @@ public class DebugDataCollector {
     }
 
     /**
-     * Robust PyCharm collection:
-     * - Prefer presentation (what the UI shows)
-     * - Then try PyDebugValue reflection for metadata/children
-     * - Then computeChildren fallback (XValue native)
-     * - Finally, as last resort, evaluate repr(var) in frame (async)
-     *
-     * Guarantees: onComplete.run() will be invoked once.
+     * Main PyCharm collection (presentation/reflection/children/eval).
+     * KEY FIX: implement both XValueNode.setPresentation overloads to capture values presented by PyCharm.
      */
     private static void collectPyCharmValueAndChildren(XStackFrame frame, XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
@@ -223,42 +210,57 @@ public class DebugDataCollector {
         final Runnable finishOnce = () -> { if (finished.compareAndSet(false, true)) onComplete.run(); };
 
         try {
-            // Always try to read presentation first (most reliable)
             value.computePresentation(new XValueNode() {
                 @Override
                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                    // This overload is used by many XValue implementations — capture what's shown in UI
                     try {
-                        // 1) Presentation (what the IDE shows)
                         String pres = renderPresentationText(presentation);
-                        logger.debug("collectPyCharm: presentation for '" + parent.name + "' => '" + pres + "', type=" + presentation.getType() + ", hasChildren=" + hasChildren);
-                        if (pres != null && !pres.isEmpty() && !"Collecting data...".equals(pres)) {
-                            parent.value = pres;
-                        }
+                        logger.debug("collectPyCharm: presentation (XValuePresentation) for '" + parent.name + "' => '" + pres + "', type=" + presentation.getType() + ", hasChildren=" + hasChildren);
+                        if (pres != null && !pres.isEmpty() && !"Collecting data...".equals(pres)) parent.value = pres;
                         if (presentation.getType() != null) parent.type = presentation.getType();
                     } catch (Throwable t) {
                         logger.debug("collectPyCharm: presentation parsing failed: " + t.getMessage());
                     }
 
-                    // 2) Try reflection to get descriptor and children (PyCharm-specific)
+                    // keep going: try descriptor/reflection/children/eval in sequence
+                    proceedWithDescriptorChildrenOrFallback(hasChildren);
+                }
+
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String valueStr, boolean hasChildren) {
+                    // IMPORTANT: PyCharm (and other debuggers) often call this string-based overload.
+                    try {
+                        logger.debug("collectPyCharm: presentation (String) for '" + parent.name + "' => '" + valueStr + "', type=" + type + ", hasChildren=" + hasChildren);
+                        if (valueStr != null && !valueStr.isEmpty() && !"Collecting data...".equals(valueStr)) parent.value = valueStr;
+                        if (type != null && !type.isEmpty()) parent.type = type;
+                    } catch (Throwable t) {
+                        logger.debug("collectPyCharm: string-presentation parse failed: " + t.getMessage());
+                    }
+
+                    // keep going: try descriptor/reflection/children/eval in sequence
+                    proceedWithDescriptorChildrenOrFallback(hasChildren);
+                }
+
+                private void proceedWithDescriptorChildrenOrFallback(boolean hasChildren) {
+                    // Descriptor reflection attempt
                     try {
                         Object pyDebugValue = tryGetPyDebugValue(value);
                         if (pyDebugValue != null) {
                             logger.debug("collectPyCharm: found pyDebugValue descriptor for '" + parent.name + "': " + safeClassName(pyDebugValue));
                             String reflName = tryGetPyName(pyDebugValue);
-                            String reflVal  = tryGetPyValue(pyDebugValue);
+                            String reflVal = tryGetPyValue(pyDebugValue);
                             String reflType = tryGetPyType(pyDebugValue);
                             if (reflName != null && !reflName.isEmpty()) parent.name = reflName;
                             if (reflVal != null && !reflVal.isEmpty() && !"unavailable".equals(reflVal)) parent.value = reflVal;
                             if (reflType != null) parent.type = reflType;
 
-                            // FIRST: well-known getChildren()/getValue().getChildren() paths (fast)
+                            // try well-known children paths
                             List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
                             if (pyChildren != null && !pyChildren.isEmpty()) {
-                                logger.debug("collectPyCharm: descriptor provided " + pyChildren.size() + " children for '" + parent.name + "'");
                                 AtomicInteger pending = new AtomicInteger(pyChildren.size());
                                 for (Object childObj : pyChildren) {
                                     try {
-                                        // If it's an XValue already -> recurse properly
                                         if (childObj instanceof XValue) {
                                             XValue childX = (XValue) childObj;
                                             MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
@@ -267,34 +269,8 @@ public class DebugDataCollector {
                                                 if (pending.decrementAndGet() == 0) finishOnce.run();
                                             });
                                         } else {
-                                            // Descriptor-only child (not XValue): best-effort leaf using reflection
                                             MutableSnapshotItem childItem = createSnapshotFromDescriptor(childObj);
                                             parent.children.add(childItem);
-                                            if (pending.decrementAndGet() == 0) finishOnce.run();
-                                        }
-                                    } catch (Throwable inner) {
-                                        if (pending.decrementAndGet() == 0) finishOnce.run();
-                                    }
-                                }
-                                return; // descriptor children handled (or scheduled) — exit
-                            }
-
-                            // SECOND: try to find children by inspecting methods/fields (more aggressive)
-                            List<Object> reflectiveChildren = inspectDescriptorForChildren(pyDebugValue);
-                            if (reflectiveChildren != null && !reflectiveChildren.isEmpty()) {
-                                logger.debug("collectPyCharm: reflectiveChildren count=" + reflectiveChildren.size() + " for '" + parent.name + "'");
-                                AtomicInteger pending = new AtomicInteger(reflectiveChildren.size());
-                                for (Object childObj : reflectiveChildren) {
-                                    try {
-                                        MutableSnapshotItem childItem = (childObj instanceof XValue)
-                                                ? new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field")
-                                                : createSnapshotFromDescriptor(childObj);
-                                        parent.children.add(childItem);
-                                        if (childObj instanceof XValue) {
-                                            collectPyCharmValueAndChildren(frame, (XValue) childObj, childItem, currentDepth + 1, () -> {
-                                                if (pending.decrementAndGet() == 0) finishOnce.run();
-                                            });
-                                        } else {
                                             if (pending.decrementAndGet() == 0) finishOnce.run();
                                         }
                                     } catch (Throwable inner) {
@@ -304,6 +280,29 @@ public class DebugDataCollector {
                                 return;
                             }
 
+                            // aggressive inspect for children
+                            List<Object> reflectiveChildren = inspectDescriptorForChildren(pyDebugValue);
+                            if (reflectiveChildren != null && !reflectiveChildren.isEmpty()) {
+                                AtomicInteger pending = new AtomicInteger(reflectiveChildren.size());
+                                for (Object childObj : reflectiveChildren) {
+                                    try {
+                                        if (childObj instanceof XValue) {
+                                            MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
+                                            parent.children.add(childItem);
+                                            collectPyCharmValueAndChildren(frame, (XValue) childObj, childItem, currentDepth + 1, () -> {
+                                                if (pending.decrementAndGet() == 0) finishOnce.run();
+                                            });
+                                        } else {
+                                            MutableSnapshotItem childItem = createSnapshotFromDescriptor(childObj);
+                                            parent.children.add(childItem);
+                                            if (pending.decrementAndGet() == 0) finishOnce.run();
+                                        }
+                                    } catch (Throwable inner) {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
+                                    }
+                                }
+                                return;
+                            }
                         } else {
                             logger.debug("collectPyCharm: no pyDebugValue descriptor for '" + parent.name + "'");
                         }
@@ -311,7 +310,7 @@ public class DebugDataCollector {
                         logger.debug("collectPyCharm: reflection attempt failed: " + reflErr.getMessage());
                     }
 
-                    // 3) Fallback to XValue.computeChildren (the most reliable fallback for nested XValue)
+                    // fallback to computeChildren
                     try {
                         if (hasChildren) {
                             value.computeChildren(new XCompositeNode() {
@@ -335,13 +334,13 @@ public class DebugDataCollector {
                                 @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { finishOnce.run(); }
                                 @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
                             });
-                            return; // computeChildren scheduled; will call finishOnce when done
+                            return;
                         }
                     } catch (Throwable childErr) {
                         logger.debug("collectPyCharm: computeChildren failed: " + childErr.getMessage());
                     }
 
-                    // 4) Last resort: evaluate repr(var) in the frame (async) and use its presentation
+                    // last resort: evaluate repr(name)
                     try {
                         boolean needEval = (parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value));
                         if (needEval && frame.getEvaluator() != null && parent.name != null && !parent.name.isEmpty()) {
@@ -350,6 +349,7 @@ public class DebugDataCollector {
                             frame.getEvaluator().evaluate(expr, new XDebuggerEvaluator.XEvaluationCallback() {
                                 @Override
                                 public void evaluated(@NotNull XValue result) {
+                                    // handle both presentation overloads on result
                                     try {
                                         result.computePresentation(new XValueNode() {
                                             @Override
@@ -357,13 +357,16 @@ public class DebugDataCollector {
                                                 String ev = renderPresentationText(presentation);
                                                 if (ev != null && !ev.isEmpty()) parent.value = ev;
                                             }
+                                            @Override
+                                            public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                                if (value != null && !value.isEmpty()) parent.value = value;
+                                                if (type != null) parent.type = type;
+                                            }
                                             @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                            @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
                                         }, XValuePlace.TREE);
                                     } catch (Throwable e) {
                                         logger.debug("collectPyCharm: eval presentation parse failed: " + e.getMessage());
                                     } finally {
-                                        // aggressive evals + dump if still empty
                                         postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                                     }
                                 }
@@ -373,18 +376,17 @@ public class DebugDataCollector {
                                     postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                                 }
                             }, null);
-                            return; // evaluation scheduled
+                            return;
                         }
                     } catch (Throwable e) {
                         logger.debug("collectPyCharm: evaluator attempt failed: " + e.getMessage());
                     }
 
-                    // If we didn't do evaluator above, still attempt aggressive evals/dump before finishing
+                    // if nothing else done, try aggressive evals/dump
                     postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                 }
 
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) {
             logger.warn("collectPyCharmValueAndChildren outer failure: " + t.getMessage());
@@ -393,10 +395,6 @@ public class DebugDataCollector {
         }
     }
 
-    /**
-     * After a basic eval/retrieval attempt, try multiple eval templates (aggressive attempts).
-     * If still no usable value, dump descriptor to file for inspection, then call finishOnce.
-     */
     private static void postEvalAggressiveOrDump(XStackFrame frame, XValue value, MutableSnapshotItem parent, Runnable finishOnce) {
         try {
             if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && frame != null) {
@@ -429,23 +427,12 @@ public class DebugDataCollector {
         }
     }
 
-    /**
-     * Try multiple evaluator expressions in the frame until one yields a non-empty presentation.
-     * Calls onDone.run() when finished (whether successful or not).
-     */
     private static void evaluateExpressions(XStackFrame frame, String varName, List<String> exprTemplates, MutableSnapshotItem parent, Runnable onDone) {
-        if (frame == null || frame.getEvaluator() == null || varName == null || varName.isEmpty()) {
-            onDone.run();
-            return;
-        }
+        if (frame == null || frame.getEvaluator() == null || varName == null || varName.isEmpty()) { onDone.run(); return; }
 
-        // Build the concrete expressions by replacing %s placeholders
         List<String> exprs = new ArrayList<>();
-        for (String tmpl : exprTemplates) {
-            exprs.add(tmpl.replace("%s", varName));
-        }
+        for (String tmpl : exprTemplates) exprs.add(tmpl.replace("%s", varName));
 
-        // recursive helper index-based
         class Ctx {
             void tryIndex(int idx) {
                 if (idx >= exprs.size()) { onDone.run(); return; }
@@ -461,17 +448,19 @@ public class DebugDataCollector {
                                     public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                                         String val = renderPresentationText(presentation);
                                         logger.debug("evaluateExpressions: eval result for expr=" + expr + " => '" + val + "'");
-                                        if (val != null && !val.isEmpty() && !"Collecting data...".equals(val)) {
-                                            parent.value = val;
-                                        }
+                                        if (val != null && !val.isEmpty() && !"Collecting data...".equals(val)) parent.value = val;
+                                    }
+                                    @Override
+                                    public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                        logger.debug("evaluateExpressions: eval result (String) for expr=" + expr + " => '" + value + "'");
+                                        if (value != null && !value.isEmpty() && !"Collecting data...".equals(value)) parent.value = value;
+                                        if (type != null && !type.isEmpty()) parent.type = type;
                                     }
                                     @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
                                 }, XValuePlace.TREE);
                             } catch (Throwable e) {
                                 logger.debug("evaluateExpressions: eval presentation parse failed: " + e.getMessage());
                             } finally {
-                                // If we got a value, finish, otherwise try next
                                 if (parent.value != null && !parent.value.isEmpty() && !"unavailable".equals(parent.value)) {
                                     onDone.run();
                                 } else {
@@ -479,7 +468,6 @@ public class DebugDataCollector {
                                 }
                             }
                         }
-
                         @Override
                         public void errorOccurred(@NotNull String errorMessage) {
                             logger.debug("evaluateExpressions: eval error for expr=" + expr + " -> " + errorMessage);
@@ -495,18 +483,11 @@ public class DebugDataCollector {
         new Ctx().tryIndex(0);
     }
 
-    /**
-     * Attempts to get PyCharm children, using several reflection strategies and broad checks.
-     * Returns a list which may contain XValue instances or descriptor objects.
-     * If none found, returns empty list.
-     *
-     * This version tries several common method names and shapes, but if none found it returns empty.
-     */
     private static List<Object> tryGetPyChildren(Object pyDebugValue) {
         try {
             if (pyDebugValue == null) return Collections.emptyList();
 
-            // 1) direct getChildren()
+            // try getChildren()
             try {
                 Method getChildren = pyDebugValue.getClass().getMethod("getChildren");
                 Object res = getChildren.invoke(pyDebugValue);
@@ -517,7 +498,7 @@ public class DebugDataCollector {
                 }
             } catch (NoSuchMethodException ignored) {}
 
-            // 2) getValue().getChildren()
+            // try getValue().getChildren()
             try {
                 Method getValue = pyDebugValue.getClass().getMethod("getValue");
                 Object val = getValue.invoke(pyDebugValue);
@@ -537,19 +518,13 @@ public class DebugDataCollector {
         } catch (Throwable t) {
             logger.debug("tryGetPyChildren failed early: " + t.getMessage());
         }
-        // Nothing found via common paths
         return Collections.emptyList();
     }
 
-    /**
-     * Inspect arbitrary descriptor object for iterable/map/array fields or zero-arg methods returning collection-like values.
-     * Returns list of raw child objects (may be descriptors or XValue instances).
-     */
     private static List<Object> inspectDescriptorForChildren(Object descriptor) {
         if (descriptor == null) return Collections.emptyList();
         List<Object> out = new ArrayList<>();
         try {
-            // 1) Inspect declared fields (including private) for collections/arrays/maps
             Field[] fields = descriptor.getClass().getDeclaredFields();
             for (Field f : fields) {
                 try {
@@ -560,18 +535,15 @@ public class DebugDataCollector {
                     if (!list.isEmpty()) {
                         out.addAll(list);
                         logger.debug("inspectDescriptorForChildren: found children via field " + f.getName());
-                        // continue scanning to collect more children
                     }
                 } catch (Throwable ignored) {}
             }
 
-            // 2) Inspect zero-arg methods that return iterable/map/array
             Method[] methods = descriptor.getClass().getMethods();
             for (Method m : methods) {
                 try {
                     if (m.getParameterCount() != 0) continue;
                     String name = m.getName().toLowerCase();
-                    // prefer methods with 'children', 'items', 'values', 'elements' etc in name to reduce noise
                     if (!(name.contains("children") || name.contains("items") || name.contains("values") || name.contains("elements"))) continue;
                     Object res = m.invoke(descriptor);
                     List<Object> list = listFromPossibleCollection(res);
@@ -582,7 +554,6 @@ public class DebugDataCollector {
                 } catch (Throwable ignored) {}
             }
 
-            // 3) Last resort: some descriptors expose a 'toArray' or 'asList' methods
             for (Method m : methods) {
                 try {
                     if (m.getParameterCount() != 0) continue;
@@ -604,35 +575,19 @@ public class DebugDataCollector {
         return out;
     }
 
-    /**
-     * Convert an object that may be a Collection, Iterable, Map, array, or single element into a List<Object>.
-     */
     private static List<Object> listFromPossibleCollection(Object obj) {
         List<Object> out = new ArrayList<>();
         try {
             if (obj == null) return out;
-            if (obj instanceof List) {
-                out.addAll((List<?>) obj);
-                return out;
-            }
-            if (obj instanceof Collection) {
-                out.addAll((Collection<?>) obj);
-                return out;
-            }
-            if (obj instanceof Map) {
-                out.addAll(((Map<?, ?>) obj).entrySet());
-                return out;
-            }
-            if (obj instanceof Iterable) {
-                for (Object o : (Iterable<?>) obj) out.add(o);
-                return out;
-            }
+            if (obj instanceof List) { out.addAll((List<?>) obj); return out; }
+            if (obj instanceof Collection) { out.addAll((Collection<?>) obj); return out; }
+            if (obj instanceof Map) { out.addAll(((Map<?, ?>) obj).entrySet()); return out; }
+            if (obj instanceof Iterable) { for (Object o : (Iterable<?>) obj) out.add(o); return out; }
             if (obj.getClass().isArray()) {
                 int len = Array.getLength(obj);
                 for (int i = 0; i < len; i++) out.add(Array.get(obj, i));
                 return out;
             }
-            // If it's a single descriptor object, return as a single-element list
             out.add(obj);
             return out;
         } catch (Throwable t) {
@@ -641,28 +596,12 @@ public class DebugDataCollector {
         }
     }
 
-    /**
-     * Build a MutableSnapshotItem from an arbitrary descriptor object by reflecting getName/getValue/getType and/or toString.
-     * This is the key helper that ensures descriptor-only children appear in the snapshot even when they're not XValue.
-     */
     private static MutableSnapshotItem createSnapshotFromDescriptor(Object desc) {
         try {
             String name = null, type = null, value = null;
-            try {
-                Method m = desc.getClass().getMethod("getName");
-                Object r = m.invoke(desc);
-                if (r != null) name = r.toString();
-            } catch (Throwable ignored) {}
-            try {
-                Method m = desc.getClass().getMethod("getType");
-                Object r = m.invoke(desc);
-                if (r != null) type = r.toString();
-            } catch (Throwable ignored) {}
-            try {
-                Method m = desc.getClass().getMethod("getValue");
-                Object r = m.invoke(desc);
-                if (r != null) value = r.toString();
-            } catch (Throwable ignored) {}
+            try { Method m = desc.getClass().getMethod("getName"); Object r = m.invoke(desc); if (r != null) name = r.toString(); } catch (Throwable ignored) {}
+            try { Method m = desc.getClass().getMethod("getType"); Object r = m.invoke(desc); if (r != null) type = r.toString(); } catch (Throwable ignored) {}
+            try { Method m = desc.getClass().getMethod("getValue"); Object r = m.invoke(desc); if (r != null) value = r.toString(); } catch (Throwable ignored) {}
             if ((value == null || value.isEmpty()) && desc != null) {
                 try { value = desc.toString(); } catch (Throwable ignored) {}
             }
@@ -671,7 +610,6 @@ public class DebugDataCollector {
             if (value == null || value.isEmpty()) value = "unavailable";
             MutableSnapshotItem msi = new MutableSnapshotItem(name, type, value, "Field");
 
-            // Try to collect nested children from this descriptor (best-effort)
             List<Object> nested = tryGetPyChildren(desc);
             if (nested == null || nested.isEmpty()) nested = inspectDescriptorForChildren(desc);
             if (nested != null && !nested.isEmpty()) {
@@ -691,7 +629,6 @@ public class DebugDataCollector {
         try {
             if (xValue == null) return null;
 
-            // 1) Common path: NodeDescriptorProvider
             try {
                 if (xValue instanceof com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) {
                     Object desc = ((com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider) xValue).getDescriptor();
@@ -702,7 +639,6 @@ public class DebugDataCollector {
                 }
             } catch (Throwable ignored) {}
 
-            // 2) Reflective getDescriptor (classloader boundaries)
             try {
                 Class<?> nodeProviderClass = Class.forName("com.intellij.debugger.ui.impl.watch.NodeDescriptorProvider");
                 if (nodeProviderClass.isInstance(xValue)) {
@@ -715,14 +651,12 @@ public class DebugDataCollector {
                 }
             } catch (Throwable ignored) {}
 
-            // 3) Sometimes the xValue itself *is* a PyDebugValue (rare) — check by class name
             try {
                 if (isPyDebugValue(xValue)) {
                     logger.debug("tryGetPyDebugValue: xValue is PyDebugValue instance: " + safeClassName(xValue));
                     return xValue;
                 }
             } catch (Throwable ignored) {}
-
         } catch (Throwable t) {
             logger.debug("tryGetPyDebugValue error: " + t.getMessage());
         }
@@ -754,10 +688,6 @@ public class DebugDataCollector {
         return "unknown";
     }
 
-    /**
-     * Dump reflection info about a descriptor or object to a log file in the user's home directory.
-     * Useful when descriptors differ between PyCharm versions — this file will show available methods and some returns.
-     */
     private static void dumpDescriptorToFile(Object desc, String varName) {
         try {
             String ts = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
@@ -777,7 +707,6 @@ public class DebugDataCollector {
                     for (Method m : methods) {
                         if (m.getParameterCount() == 0) {
                             String mname = m.getName();
-                            // skip noisy methods
                             if (mname.equals("getClass")) continue;
                             try {
                                 Object res = null;
@@ -788,7 +717,6 @@ public class DebugDataCollector {
                                     String rcls = res.getClass().getName();
                                     String rstr = "";
                                     try { rstr = String.valueOf(res.toString()); } catch (Throwable t) { rstr = "toString failed: " + t.getMessage(); }
-                                    // truncate long strings
                                     if (rstr.length() > 1000) rstr = rstr.substring(0, 1000) + "...(truncated)";
                                     pw.println(mname + " -> (" + rcls + ") " + rstr);
                                 }
@@ -827,9 +755,6 @@ public class DebugDataCollector {
         } catch (Throwable t) { return "(toString failed)"; }
     }
 
-    /**
-     * Recursively collects child values for Java (native) debugger.
-     */
     private static void collectValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
         try {
@@ -871,8 +796,41 @@ public class DebugDataCollector {
                         }
                     }
                 }
+
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                    try {
+                        if (type != null && !type.isEmpty()) parent.type = type;
+                        if (value != null && !value.isEmpty()) parent.value = value;
+                    } catch (Throwable t) { parent.value = "Value not available"; }
+                    if (hasChildren) {
+                        value.computeChildren(new XCompositeNode() {
+                            @Override
+                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                AtomicInteger pending = new AtomicInteger(children.size());
+                                if (children.size() == 0) { onComplete.run(); return; }
+                                for (int i = 0; i < children.size(); i++) {
+                                    String childName = children.getName(i);
+                                    XValue childValue = children.getValue(i);
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
+                                    collectValueAndChildren(childValue, childItem, currentDepth + 1, () -> {
+                                        if (pending.decrementAndGet() == 0) onComplete.run();
+                                    });
+                                }
+                            }
+                            @Override public void tooManyChildren(int remaining) { onComplete.run(); }
+                            @Override public void setAlreadySorted(boolean alreadySorted) {}
+                            @Override public void setErrorMessage(@NotNull String errorMessage) { onComplete.run(); }
+                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { onComplete.run(); }
+                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                        });
+                    } else {
+                        onComplete.run();
+                    }
+                }
+
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) {
             logger.warn("collectValueAndChildren failed: " + t.getMessage());
@@ -901,7 +859,6 @@ public class DebugDataCollector {
                         break;
                     }
                 }
-                // Fallback for PyCharm: check for __exception__ by name
                 if (!foundException && isPyCharmEnvironment()) {
                     for (int i = 0; i < children.size(); i++) {
                         if ("__exception__".equals(children.getName(i))) {
@@ -924,10 +881,9 @@ public class DebugDataCollector {
         });
     }
 
-    // --- Exception helpers (unchanged from previous) ---
+    // --- Exception helpers (kept, but setPresentation overloads implemented where computePresentation used) ---
 
     private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
-        // Try to compute children; if not 3 members, fallback to reflection-based extraction.
         final AtomicBoolean usedFallback = new AtomicBoolean(false);
         try {
             exceptionTuple.computeChildren(new XCompositeNode() {
@@ -978,7 +934,6 @@ public class DebugDataCollector {
                     instance.latestException = detail;
                     callback.accept(new ContextItem(detail, true, ContextItem.Type.EXCEPTION));
                 }
-
                 @Override public void tooManyChildren(int remaining) {}
                 @Override public void setAlreadySorted(boolean alreadySorted) {}
                 @Override public void setErrorMessage(@NotNull String errorMessage) {}
@@ -1010,8 +965,10 @@ public class DebugDataCollector {
                 @Override public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                     if (presentation.getType() != null) type[0] = presentation.getType();
                 }
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                    if (type != null && !type.isEmpty()) type[0] = type;
+                }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable ignored) {}
         return type[0];
@@ -1031,8 +988,10 @@ public class DebugDataCollector {
                                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                                     sb.append(renderPresentationText(presentation));
                                 }
+                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                    sb.append(value);
+                                }
                                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
                             }, XValuePlace.TREE);
                         }
                     }
@@ -1061,8 +1020,10 @@ public class DebugDataCollector {
                                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                                     sb.append(renderPresentationText(presentation)).append("\n");
                                 }
+                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                    sb.append(value).append("\n");
+                                }
                                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
                             }, XValuePlace.TREE);
                         }
                     }
@@ -1164,8 +1125,13 @@ public class DebugDataCollector {
                         if (state.isComplete()) completeExceptionState(state, callback);
                     }
                 }
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                    if (!"Collecting data...".equals(value)) {
+                        state.setDetailMessage(value);
+                        if (state.isComplete()) completeExceptionState(state, callback);
+                    }
+                }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) { logger.debug("processDetailMessage failed: " + t.getMessage()); }
     }
@@ -1178,8 +1144,11 @@ public class DebugDataCollector {
                     state.setStackTrace(renderPresentationText(presentation));
                     if (state.isComplete()) completeExceptionState(state, callback);
                 }
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                    state.setStackTrace(value);
+                    if (state.isComplete()) completeExceptionState(state, callback);
+                }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) { logger.debug("processStackTrace failed: " + t.getMessage()); }
     }
@@ -1219,8 +1188,10 @@ public class DebugDataCollector {
                     String typeStr = presentation.getType();
                     if (typeStr != null && typeStr.toLowerCase().contains("exception")) type[0] = typeStr;
                 }
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
+                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) type[0] = typeStr;
+                }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) { logger.debug("getExceptionType failed: " + t.getMessage()); }
         return type[0];
@@ -1265,8 +1236,10 @@ public class DebugDataCollector {
                         });
                         rendered[0] = sb.toString();
                     }
+                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                        rendered[0] = value;
+                    }
                     @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
                 }, XValuePlace.TREE);
             } catch (Throwable t) { logger.debug("extractBaseMessageSafe presentation render error: " + t.getMessage()); }
             return rendered[0];
@@ -1335,4 +1308,3 @@ public class DebugDataCollector {
         }
     }
 }
-
