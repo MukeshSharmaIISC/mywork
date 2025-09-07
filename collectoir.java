@@ -29,8 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
- * DebugDataCollector - full file. Key fix: implement both XValueNode.setPresentation overloads
- * (XValuePresentation and (String type, String value)) so PyCharm presentations are not lost.
+ * DebugDataCollector - improved PyCharm support, cycle-/size-guards, and shadowing fixes.
  */
 public class DebugDataCollector {
 
@@ -143,12 +142,19 @@ public class DebugDataCollector {
         AtomicInteger debuggerCalls = new AtomicInteger(0);
         AtomicBoolean limitReached = new AtomicBoolean(false);
 
+        // shared guards for this snapshot collection
+        final AtomicInteger totalNodes = new AtomicInteger(0);
+        final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+
         try {
             currentStackFrame.computeChildren(new XCompositeNode() {
                 @Override
                 public void addChildren(@NotNull XValueChildrenList children, boolean last) {
                     AtomicInteger pending = new AtomicInteger(children.size());
-                    if (children.size() == 0) complete();
+                    if (children.size() == 0) {
+                        complete();
+                        return;
+                    }
                     for (int i = 0; i < children.size(); i++) {
                         if (limitReached.get() || debuggerCalls.get() >= Constants.MAX_CALLS_TO_DEBUGGER
                                 || new Gson().toJson(snapshotItems).length() > Constants.MAX_SNAPSHOT_JSON_SIZE_BYTES) {
@@ -164,11 +170,11 @@ public class DebugDataCollector {
 
                         if (isPyCharmEnvironment()) {
                             logger.debug("Trying PyCharm-specific collection for variable: " + varName);
-                            collectPyCharmValueAndChildren(currentStackFrame, childValue, mutableItem, 0, () -> {
+                            collectPyCharmValueAndChildren(currentStackFrame, childValue, mutableItem, 0, visited, totalNodes, () -> {
                                 if (pending.decrementAndGet() == 0) complete();
                             });
                         } else {
-                            collectValueAndChildren(childValue, mutableItem, 0, () -> {
+                            collectValueAndChildren(childValue, mutableItem, 0, visited, totalNodes, () -> {
                                 if (pending.decrementAndGet() == 0) complete();
                             });
                         }
@@ -200,132 +206,63 @@ public class DebugDataCollector {
     }
 
     /**
-     * Main PyCharm collection (presentation/reflection/children/eval).
-     * KEY FIX: implement both XValueNode.setPresentation overloads to capture values presented by PyCharm.
+     * XValue (native) recursive collector with cycle and size guards.
      */
-    private static void collectPyCharmValueAndChildren(XStackFrame frame, XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
+    private static void collectValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth,
+                                                Set<Object> visited, AtomicInteger totalNodes, Runnable onComplete) {
         if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
 
+        // global node cap
+        if (totalNodes.incrementAndGet() > Constants.MAX_TOTAL_NODES) {
+            parent.value = "[truncated: max nodes]";
+            onComplete.run();
+            return;
+        }
+
+        Object identityKey = value;
+        if (identityKey == null) { onComplete.run(); return; }
+        if (!visited.add(identityKey)) { parent.value = "[cyclic]"; onComplete.run(); return; }
+
+        final XValue xValueLocal = value;
         final AtomicBoolean finished = new AtomicBoolean(false);
         final Runnable finishOnce = () -> { if (finished.compareAndSet(false, true)) onComplete.run(); };
 
         try {
-            value.computePresentation(new XValueNode() {
+            xValueLocal.computePresentation(new XValueNode() {
                 @Override
                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                    // This overload is used by many XValue implementations — capture what's shown in UI
                     try {
-                        String pres = renderPresentationText(presentation);
-                        logger.debug("collectPyCharm: presentation (XValuePresentation) for '" + parent.name + "' => '" + pres + "', type=" + presentation.getType() + ", hasChildren=" + hasChildren);
-                        if (pres != null && !pres.isEmpty() && !"Collecting data...".equals(pres)) parent.value = pres;
                         if (presentation.getType() != null) parent.type = presentation.getType();
-                    } catch (Throwable t) {
-                        logger.debug("collectPyCharm: presentation parsing failed: " + t.getMessage());
-                    }
-
-                    // keep going: try descriptor/reflection/children/eval in sequence
-                    proceedWithDescriptorChildrenOrFallback(hasChildren);
-                }
-
-                @Override
-                public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String valueStr, boolean hasChildren) {
-                    // IMPORTANT: PyCharm (and other debuggers) often call this string-based overload.
-                    try {
-                        logger.debug("collectPyCharm: presentation (String) for '" + parent.name + "' => '" + valueStr + "', type=" + type + ", hasChildren=" + hasChildren);
-                        if (valueStr != null && !valueStr.isEmpty() && !"Collecting data...".equals(valueStr)) parent.value = valueStr;
-                        if (type != null && !type.isEmpty()) parent.type = type;
-                    } catch (Throwable t) {
-                        logger.debug("collectPyCharm: string-presentation parse failed: " + t.getMessage());
-                    }
-
-                    // keep going: try descriptor/reflection/children/eval in sequence
-                    proceedWithDescriptorChildrenOrFallback(hasChildren);
-                }
-
-                private void proceedWithDescriptorChildrenOrFallback(boolean hasChildren) {
-                    // Descriptor reflection attempt
-                    try {
-                        Object pyDebugValue = tryGetPyDebugValue(value);
-                        if (pyDebugValue != null) {
-                            logger.debug("collectPyCharm: found pyDebugValue descriptor for '" + parent.name + "': " + safeClassName(pyDebugValue));
-                            String reflName = tryGetPyName(pyDebugValue);
-                            String reflVal = tryGetPyValue(pyDebugValue);
-                            String reflType = tryGetPyType(pyDebugValue);
-                            if (reflName != null && !reflName.isEmpty()) parent.name = reflName;
-                            if (reflVal != null && !reflVal.isEmpty() && !"unavailable".equals(reflVal)) parent.value = reflVal;
-                            if (reflType != null) parent.type = reflType;
-
-                            // try well-known children paths
-                            List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
-                            if (pyChildren != null && !pyChildren.isEmpty()) {
-                                AtomicInteger pending = new AtomicInteger(pyChildren.size());
-                                for (Object childObj : pyChildren) {
-                                    try {
-                                        if (childObj instanceof XValue) {
-                                            XValue childX = (XValue) childObj;
-                                            MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
-                                            parent.children.add(childItem);
-                                            collectPyCharmValueAndChildren(frame, childX, childItem, currentDepth + 1, () -> {
-                                                if (pending.decrementAndGet() == 0) finishOnce.run();
-                                            });
-                                        } else {
-                                            MutableSnapshotItem childItem = createSnapshotFromDescriptor(childObj);
-                                            parent.children.add(childItem);
-                                            if (pending.decrementAndGet() == 0) finishOnce.run();
-                                        }
-                                    } catch (Throwable inner) {
-                                        if (pending.decrementAndGet() == 0) finishOnce.run();
-                                    }
-                                }
-                                return;
-                            }
-
-                            // aggressive inspect for children
-                            List<Object> reflectiveChildren = inspectDescriptorForChildren(pyDebugValue);
-                            if (reflectiveChildren != null && !reflectiveChildren.isEmpty()) {
-                                AtomicInteger pending = new AtomicInteger(reflectiveChildren.size());
-                                for (Object childObj : reflectiveChildren) {
-                                    try {
-                                        if (childObj instanceof XValue) {
-                                            MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
-                                            parent.children.add(childItem);
-                                            collectPyCharmValueAndChildren(frame, (XValue) childObj, childItem, currentDepth + 1, () -> {
-                                                if (pending.decrementAndGet() == 0) finishOnce.run();
-                                            });
-                                        } else {
-                                            MutableSnapshotItem childItem = createSnapshotFromDescriptor(childObj);
-                                            parent.children.add(childItem);
-                                            if (pending.decrementAndGet() == 0) finishOnce.run();
-                                        }
-                                    } catch (Throwable inner) {
-                                        if (pending.decrementAndGet() == 0) finishOnce.run();
-                                    }
-                                }
-                                return;
-                            }
-                        } else {
-                            logger.debug("collectPyCharm: no pyDebugValue descriptor for '" + parent.name + "'");
+                        String rendered = renderPresentationText(presentation);
+                        if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value))
+                                && rendered != null && !rendered.isEmpty()) {
+                            parent.value = rendered;
                         }
-                    } catch (Throwable reflErr) {
-                        logger.debug("collectPyCharm: reflection attempt failed: " + reflErr.getMessage());
-                    }
-
-                    // fallback to computeChildren
-                    try {
+                    } catch (Exception e) {
+                        parent.value = "Value not available";
+                    } finally {
                         if (hasChildren) {
-                            value.computeChildren(new XCompositeNode() {
+                            xValueLocal.computeChildren(new XCompositeNode() {
                                 @Override
                                 public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                                    if (children.size() == 0) { finishOnce.run(); return; }
-                                    AtomicInteger pending = new AtomicInteger(children.size());
-                                    for (int i = 0; i < children.size(); i++) {
+                                    int childCount = Math.min(children.size(), Constants.MAX_CHILDREN_PER_NODE);
+                                    if (children.size() > Constants.MAX_CHILDREN_PER_NODE) {
+                                        parent.value = (parent.value == null ? "" : parent.value) + " [truncated children]";
+                                    }
+                                    if (childCount == 0) { finishOnce.run(); return; }
+                                    AtomicInteger pending = new AtomicInteger(childCount);
+                                    for (int i = 0; i < childCount; i++) {
                                         String childName = children.getName(i);
-                                        XValue childVal = children.getValue(i);
-                                        MutableSnapshotItem childItem = new MutableSnapshotItem(childName != null ? childName : "unknown", "unknown", "unavailable", "Field");
+                                        XValue childValue = children.getValue(i);
+                                        MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
                                         parent.children.add(childItem);
-                                        collectPyCharmValueAndChildren(frame, childVal, childItem, currentDepth + 1, () -> {
+                                        try {
+                                            collectValueAndChildren(childValue, childItem, currentDepth + 1, visited, totalNodes, () -> {
+                                                if (pending.decrementAndGet() == 0) finishOnce.run();
+                                            });
+                                        } catch (Throwable inner) {
                                             if (pending.decrementAndGet() == 0) finishOnce.run();
-                                        });
+                                        }
                                     }
                                 }
                                 @Override public void tooManyChildren(int remaining) { finishOnce.run(); }
@@ -334,155 +271,216 @@ public class DebugDataCollector {
                                 @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { finishOnce.run(); }
                                 @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
                             });
-                            return;
+                        } else {
+                            finishOnce.run();
                         }
-                    } catch (Throwable childErr) {
-                        logger.debug("collectPyCharm: computeChildren failed: " + childErr.getMessage());
                     }
+                }
 
-                    // last resort: evaluate repr(name)
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String valueStr, boolean hasChildren) {
                     try {
-                        boolean needEval = (parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value));
-                        if (needEval && frame.getEvaluator() != null && parent.name != null && !parent.name.isEmpty()) {
-                            String expr = "repr(" + parent.name + ")";
-                            logger.debug("collectPyCharm: using evaluator expr=" + expr + " for '" + parent.name + "'");
-                            frame.getEvaluator().evaluate(expr, new XDebuggerEvaluator.XEvaluationCallback() {
-                                @Override
-                                public void evaluated(@NotNull XValue result) {
-                                    // handle both presentation overloads on result
+                        if (typeStr != null && !typeStr.isEmpty()) parent.type = typeStr;
+                        if (valueStr != null && !valueStr.isEmpty()) parent.value = valueStr;
+                    } catch (Throwable t) { parent.value = "Value not available"; }
+
+                    if (hasChildren) {
+                        xValueLocal.computeChildren(new XCompositeNode() {
+                            @Override
+                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                int childCount = Math.min(children.size(), Constants.MAX_CHILDREN_PER_NODE);
+                                if (childCount == 0) { finishOnce.run(); return; }
+                                AtomicInteger pending = new AtomicInteger(childCount);
+                                for (int i = 0; i < childCount; i++) {
+                                    String childName = children.getName(i);
+                                    XValue childValue = children.getValue(i);
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
                                     try {
-                                        result.computePresentation(new XValueNode() {
-                                            @Override
-                                            public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                                                String ev = renderPresentationText(presentation);
-                                                if (ev != null && !ev.isEmpty()) parent.value = ev;
-                                            }
-                                            @Override
-                                            public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
-                                                if (value != null && !value.isEmpty()) parent.value = value;
-                                                if (type != null) parent.type = type;
-                                            }
-                                            @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                        }, XValuePlace.TREE);
-                                    } catch (Throwable e) {
-                                        logger.debug("collectPyCharm: eval presentation parse failed: " + e.getMessage());
-                                    } finally {
-                                        postEvalAggressiveOrDump(frame, value, parent, finishOnce);
+                                        collectValueAndChildren(childValue, childItem, currentDepth + 1, visited, totalNodes, () -> {
+                                            if (pending.decrementAndGet() == 0) finishOnce.run();
+                                        });
+                                    } catch (Throwable inner) {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
                                     }
                                 }
-                                @Override
-                                public void errorOccurred(@NotNull String errorMessage) {
-                                    logger.debug("collectPyCharm: evaluator error for '" + parent.name + "': " + errorMessage);
-                                    postEvalAggressiveOrDump(frame, value, parent, finishOnce);
-                                }
-                            }, null);
-                            return;
-                        }
-                    } catch (Throwable e) {
-                        logger.debug("collectPyCharm: evaluator attempt failed: " + e.getMessage());
+                            }
+                            @Override public void tooManyChildren(int remaining) { finishOnce.run(); }
+                            @Override public void setAlreadySorted(boolean alreadySorted) {}
+                            @Override public void setErrorMessage(@NotNull String errorMessage) { finishOnce.run(); }
+                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { finishOnce.run(); }
+                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                        });
+                    } else {
+                        finishOnce.run();
                     }
-
-                    // if nothing else done, try aggressive evals/dump
-                    postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                 }
 
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) {
-            logger.warn("collectPyCharmValueAndChildren outer failure: " + t.getMessage());
+            logger.warn("collectValueAndChildren failed: " + t.getMessage());
             parent.value = "Value not available";
-            finishOnce.run();
+            onComplete.run();
         }
     }
 
-    private static void postEvalAggressiveOrDump(XStackFrame frame, XValue value, MutableSnapshotItem parent, Runnable finishOnce) {
+    /**
+     * PyCharm: Recursively collects child values using reflection + computePresentation,
+     * with cycle detection and caps.
+     */
+    private static void collectPyCharmValueAndChildren(XStackFrame frame, XValue value, MutableSnapshotItem parent,
+                                                      int currentDepth, Set<Object> visited, AtomicInteger totalNodes, Runnable onComplete) {
+        if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
+
+        if (totalNodes.incrementAndGet() > Constants.MAX_TOTAL_NODES) {
+            parent.value = "[truncated: max nodes]";
+            onComplete.run();
+            return;
+        }
+
+        Object identityKey = value;
+        if (identityKey == null) { onComplete.run(); return; }
+        if (!visited.add(identityKey)) { parent.value = "[cyclic]"; onComplete.run(); return; }
+
+        final XValue xValueLocal = value;
+        final AtomicBoolean finished = new AtomicBoolean(false);
+        final Runnable finishOnce = () -> { if (finished.compareAndSet(false, true)) onComplete.run(); };
+
         try {
-            if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && frame != null) {
-                List<String> templates = Arrays.asList(
-                        "%s",
-                        "str(%s)",
-                        "repr(%s)",
-                        "type(%s).__name__",
-                        "locals().get('%s', globals().get('%s', None))",
-                        "vars(%s) if hasattr(%s, '__dict__') else None"
-                );
-                evaluateExpressions(frame, parent.name != null ? parent.name : "", templates, parent, () -> {
-                    try {
-                        if (parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) {
-                            Object desc = tryGetPyDebugValue(value);
-                            dumpDescriptorToFile(desc != null ? desc : value, parent.name != null ? parent.name : "unknown");
-                        }
-                    } catch (Throwable t) {
-                        logger.warn("postEvalAggressiveOrDump dump attempt failed: " + t.getMessage());
-                    } finally {
-                        finishOnce.run();
-                    }
-                });
-            } else {
-                finishOnce.run();
-            }
-        } catch (Throwable t) {
-            logger.warn("postEvalAggressiveOrDump failed: " + t.getMessage());
-            finishOnce.run();
-        }
-    }
-
-    private static void evaluateExpressions(XStackFrame frame, String varName, List<String> exprTemplates, MutableSnapshotItem parent, Runnable onDone) {
-        if (frame == null || frame.getEvaluator() == null || varName == null || varName.isEmpty()) { onDone.run(); return; }
-
-        List<String> exprs = new ArrayList<>();
-        for (String tmpl : exprTemplates) exprs.add(tmpl.replace("%s", varName));
-
-        class Ctx {
-            void tryIndex(int idx) {
-                if (idx >= exprs.size()) { onDone.run(); return; }
-                String expr = exprs.get(idx);
-                logger.debug("evaluateExpressions: trying expr=" + expr + " for var=" + varName);
+            Object pyDebugValue = tryGetPyDebugValue(value);
+            boolean usedReflection = false;
+            if (pyDebugValue != null) {
                 try {
-                    frame.getEvaluator().evaluate(expr, new XDebuggerEvaluator.XEvaluationCallback() {
-                        @Override
-                        public void evaluated(@NotNull XValue result) {
+                    String name = tryGetPyName(pyDebugValue);
+                    String val = tryGetPyValue(pyDebugValue);
+                    String type = tryGetPyType(pyDebugValue);
+                    if (name != null && !name.isEmpty()) parent.name = name;
+                    if (val != null && !"unavailable".equals(val) && !val.isEmpty()) parent.value = val;
+                    if (type != null && !type.isEmpty()) parent.type = type;
+                    usedReflection = true;
+
+                    List<Object> pyChildren = tryGetPyChildren(pyDebugValue);
+                    if (pyChildren != null && !pyChildren.isEmpty()) {
+                        int childCount = Math.min(pyChildren.size(), Constants.MAX_CHILDREN_PER_NODE);
+                        AtomicInteger pending = new AtomicInteger(childCount);
+                        for (int i = 0; i < childCount; i++) {
+                            Object child = pyChildren.get(i);
                             try {
-                                result.computePresentation(new XValueNode() {
-                                    @Override
-                                    public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                                        String val = renderPresentationText(presentation);
-                                        logger.debug("evaluateExpressions: eval result for expr=" + expr + " => '" + val + "'");
-                                        if (val != null && !val.isEmpty() && !"Collecting data...".equals(val)) parent.value = val;
-                                    }
-                                    @Override
-                                    public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
-                                        logger.debug("evaluateExpressions: eval result (String) for expr=" + expr + " => '" + value + "'");
-                                        if (value != null && !value.isEmpty() && !"Collecting data...".equals(value)) parent.value = value;
-                                        if (type != null && !type.isEmpty()) parent.type = type;
-                                    }
-                                    @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-                                }, XValuePlace.TREE);
-                            } catch (Throwable e) {
-                                logger.debug("evaluateExpressions: eval presentation parse failed: " + e.getMessage());
-                            } finally {
-                                if (parent.value != null && !parent.value.isEmpty() && !"unavailable".equals(parent.value)) {
-                                    onDone.run();
+                                if (child instanceof XValue) {
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem("unknown", "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
+                                    collectPyCharmValueAndChildren(frame, (XValue) child, childItem, currentDepth + 1, visited, totalNodes, () -> {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
+                                    });
                                 } else {
-                                    tryIndex(idx + 1);
+                                    MutableSnapshotItem childItem = createSnapshotFromDescriptor(child);
+                                    parent.children.add(childItem);
+                                    if (pending.decrementAndGet() == 0) finishOnce.run();
                                 }
+                            } catch (Throwable inner) {
+                                if (pending.decrementAndGet() == 0) finishOnce.run();
                             }
                         }
-                        @Override
-                        public void errorOccurred(@NotNull String errorMessage) {
-                            logger.debug("evaluateExpressions: eval error for expr=" + expr + " -> " + errorMessage);
-                            tryIndex(idx + 1);
-                        }
-                    }, null);
-                } catch (Throwable t) {
-                    logger.debug("evaluateExpressions: evaluator call failed for expr=" + expr + " -> " + t.getMessage());
-                    tryIndex(idx + 1);
+                        return;
+                    }
+                } catch (Throwable ignore) {
+                    // fall through to presentation/children fallback
                 }
             }
+
+            // fallback to presentation + children traversal (same as non-py path)
+            xValueLocal.computePresentation(new XValueNode() {
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                    try {
+                        String pres = renderPresentationText(presentation);
+                        if (pres != null && !pres.isEmpty() && !"Collecting data...".equals(pres)) parent.value = pres;
+                        if (presentation.getType() != null) parent.type = presentation.getType();
+                    } catch (Throwable t) {}
+                    if (hasChildren) {
+                        xValueLocal.computeChildren(new XCompositeNode() {
+                            @Override
+                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                int childCount = Math.min(children.size(), Constants.MAX_CHILDREN_PER_NODE);
+                                if (childCount == 0) { finishOnce.run(); return; }
+                                AtomicInteger pending = new AtomicInteger(childCount);
+                                for (int i = 0; i < childCount; i++) {
+                                    String childName = children.getName(i);
+                                    XValue childValue = children.getValue(i);
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName != null ? childName : "unknown", "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
+                                    try {
+                                        collectPyCharmValueAndChildren(frame, childValue, childItem, currentDepth + 1, visited, totalNodes, () -> {
+                                            if (pending.decrementAndGet() == 0) finishOnce.run();
+                                        });
+                                    } catch (Throwable inner) {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
+                                    }
+                                }
+                            }
+                            @Override public void tooManyChildren(int remaining) { finishOnce.run(); }
+                            @Override public void setAlreadySorted(boolean alreadySorted) {}
+                            @Override public void setErrorMessage(@NotNull String errorMessage) { finishOnce.run(); }
+                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { finishOnce.run(); }
+                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                        });
+                    } else {
+                        finishOnce.run();
+                    }
+                }
+
+                @Override
+                public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String valueStr, boolean hasChildren) {
+                    try {
+                        if (valueStr != null && !valueStr.isEmpty()) parent.value = valueStr;
+                        if (typeStr != null && !typeStr.isEmpty()) parent.type = typeStr;
+                    } catch (Throwable t) {}
+                    if (hasChildren) {
+                        xValueLocal.computeChildren(new XCompositeNode() {
+                            @Override
+                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                                int childCount = Math.min(children.size(), Constants.MAX_CHILDREN_PER_NODE);
+                                if (childCount == 0) { finishOnce.run(); return; }
+                                AtomicInteger pending = new AtomicInteger(childCount);
+                                for (int i = 0; i < childCount; i++) {
+                                    String childName = children.getName(i);
+                                    XValue childValue = children.getValue(i);
+                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
+                                    parent.children.add(childItem);
+                                    try {
+                                        collectPyCharmValueAndChildren(frame, childValue, childItem, currentDepth + 1, visited, totalNodes, () -> {
+                                            if (pending.decrementAndGet() == 0) finishOnce.run();
+                                        });
+                                    } catch (Throwable inner) {
+                                        if (pending.decrementAndGet() == 0) finishOnce.run();
+                                    }
+                                }
+                            }
+                            @Override public void tooManyChildren(int remaining) { finishOnce.run(); }
+                            @Override public void setAlreadySorted(boolean alreadySorted) {}
+                            @Override public void setErrorMessage(@NotNull String errorMessage) { finishOnce.run(); }
+                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { finishOnce.run(); }
+                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
+                        });
+                    } else {
+                        finishOnce.run();
+                    }
+                }
+
+                @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+            }, XValuePlace.TREE);
+
+        } catch (Throwable t) {
+            logger.warn("collectPyCharmValueAndChildren failed: " + t.getMessage());
+            parent.value = "Value not available";
+            onComplete.run();
         }
-        new Ctx().tryIndex(0);
     }
 
+    /**
+     * Helper attempts for PyCharm descriptors and reflection.
+     */
     private static List<Object> tryGetPyChildren(Object pyDebugValue) {
         try {
             if (pyDebugValue == null) return Collections.emptyList();
@@ -518,6 +516,7 @@ public class DebugDataCollector {
         } catch (Throwable t) {
             logger.debug("tryGetPyChildren failed early: " + t.getMessage());
         }
+        logger.debug("tryGetPyChildren: no usable children found");
         return Collections.emptyList();
     }
 
@@ -755,90 +754,6 @@ public class DebugDataCollector {
         } catch (Throwable t) { return "(toString failed)"; }
     }
 
-    private static void collectValueAndChildren(XValue value, MutableSnapshotItem parent, int currentDepth, Runnable onComplete) {
-        if (currentDepth >= Constants.MAX_DEPTH_OF_NESTED_VARIABLES) { onComplete.run(); return; }
-        try {
-            value.computePresentation(new XValueNode() {
-                @Override
-                public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                    try {
-                        if (presentation.getType() != null) parent.type = presentation.getType();
-                        String rendered = renderPresentationText(presentation);
-                        if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && rendered != null && !rendered.isEmpty())
-                            parent.value = rendered;
-                    } catch (Exception e) {
-                        parent.value = "Value not available";
-                    } finally {
-                        if (hasChildren) {
-                            value.computeChildren(new XCompositeNode() {
-                                @Override
-                                public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                                    AtomicInteger pending = new AtomicInteger(children.size());
-                                    if (children.size() == 0) { onComplete.run(); return; }
-                                    for (int i = 0; i < children.size(); i++) {
-                                        String childName = children.getName(i);
-                                        XValue childValue = children.getValue(i);
-                                        MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
-                                        parent.children.add(childItem);
-                                        collectValueAndChildren(childValue, childItem, currentDepth + 1, () -> {
-                                            if (pending.decrementAndGet() == 0) onComplete.run();
-                                        });
-                                    }
-                                }
-                                @Override public void tooManyChildren(int remaining) { onComplete.run(); }
-                                @Override public void setAlreadySorted(boolean alreadySorted) {}
-                                @Override public void setErrorMessage(@NotNull String errorMessage) { onComplete.run(); }
-                                @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { onComplete.run(); }
-                                @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
-                            });
-                        } else {
-                            onComplete.run();
-                        }
-                    }
-                }
-
-                @Override
-                public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
-                    try {
-                        if (type != null && !type.isEmpty()) parent.type = type;
-                        if (value != null && !value.isEmpty()) parent.value = value;
-                    } catch (Throwable t) { parent.value = "Value not available"; }
-                    if (hasChildren) {
-                        value.computeChildren(new XCompositeNode() {
-                            @Override
-                            public void addChildren(@NotNull XValueChildrenList children, boolean last) {
-                                AtomicInteger pending = new AtomicInteger(children.size());
-                                if (children.size() == 0) { onComplete.run(); return; }
-                                for (int i = 0; i < children.size(); i++) {
-                                    String childName = children.getName(i);
-                                    XValue childValue = children.getValue(i);
-                                    MutableSnapshotItem childItem = new MutableSnapshotItem(childName, "unknown", "unavailable", "Field");
-                                    parent.children.add(childItem);
-                                    collectValueAndChildren(childValue, childItem, currentDepth + 1, () -> {
-                                        if (pending.decrementAndGet() == 0) onComplete.run();
-                                    });
-                                }
-                            }
-                            @Override public void tooManyChildren(int remaining) { onComplete.run(); }
-                            @Override public void setAlreadySorted(boolean alreadySorted) {}
-                            @Override public void setErrorMessage(@NotNull String errorMessage) { onComplete.run(); }
-                            @Override public void setErrorMessage(@NotNull String s, @Nullable XDebuggerTreeNodeHyperlink link) { onComplete.run(); }
-                            @Override public void setMessage(@NotNull String s, @Nullable Icon icon, @NotNull com.intellij.ui.SimpleTextAttributes attrs, @Nullable XDebuggerTreeNodeHyperlink link) {}
-                        });
-                    } else {
-                        onComplete.run();
-                    }
-                }
-
-                @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
-            }, XValuePlace.TREE);
-        } catch (Throwable t) {
-            logger.warn("collectValueAndChildren failed: " + t.getMessage());
-            parent.value = "Value not available";
-            onComplete.run();
-        }
-    }
-
     public static void collectException(XStackFrame frame, Consumer<ContextItem> callback) {
         frame.computeChildren(new XCompositeNode() {
             @Override
@@ -881,7 +796,7 @@ public class DebugDataCollector {
         });
     }
 
-    // --- Exception helpers (kept, but setPresentation overloads implemented where computePresentation used) ---
+    // --- Exception helpers (implementing both setPresentation overloads) ---
 
     private static void processPyCharmExceptionTuple(XValue exceptionTuple, XStackFrame frame, Consumer<ContextItem> callback) {
         final AtomicBoolean usedFallback = new AtomicBoolean(false);
@@ -959,19 +874,19 @@ public class DebugDataCollector {
     }
 
     private static String extractTypeString(XValue value) {
-        final String[] type = {"unknown"};
+        final String[] outType = {"unknown"};
         try {
             value.computePresentation(new XValueNode() {
                 @Override public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
-                    if (presentation.getType() != null) type[0] = presentation.getType();
+                    if (presentation.getType() != null) outType[0] = presentation.getType();
                 }
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
-                    if (type != null && !type.isEmpty()) type[0] = type;
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
+                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr;
                 }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
             }, XValuePlace.TREE);
         } catch (Throwable ignored) {}
-        return type[0];
+        return outType[0];
     }
 
     private static String extractExceptionMessage(XValue value) {
@@ -988,7 +903,7 @@ public class DebugDataCollector {
                                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                                     sb.append(renderPresentationText(presentation));
                                 }
-                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
                                     sb.append(value);
                                 }
                                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
@@ -1020,7 +935,7 @@ public class DebugDataCollector {
                                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                                     sb.append(renderPresentationText(presentation)).append("\n");
                                 }
-                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
                                     sb.append(value).append("\n");
                                 }
                                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
@@ -1125,7 +1040,7 @@ public class DebugDataCollector {
                         if (state.isComplete()) completeExceptionState(state, callback);
                     }
                 }
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
                     if (!"Collecting data...".equals(value)) {
                         state.setDetailMessage(value);
                         if (state.isComplete()) completeExceptionState(state, callback);
@@ -1144,7 +1059,7 @@ public class DebugDataCollector {
                     state.setStackTrace(renderPresentationText(presentation));
                     if (state.isComplete()) completeExceptionState(state, callback);
                 }
-                @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
                     state.setStackTrace(value);
                     if (state.isComplete()) completeExceptionState(state, callback);
                 }
@@ -1180,21 +1095,21 @@ public class DebugDataCollector {
     }
 
     private static String getExceptionType(XValue value) {
-        final String[] type = {"unknown"};
+        final String[] outType = {"unknown"};
         try {
             value.computePresentation(new XValueNode() {
                 @Override
                 public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
                     String typeStr = presentation.getType();
-                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) type[0] = typeStr;
+                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr;
                 }
                 @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
-                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) type[0] = typeStr;
+                    if (typeStr != null && typeStr.toLowerCase().contains("exception")) outType[0] = typeStr;
                 }
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
             }, XValuePlace.TREE);
         } catch (Throwable t) { logger.debug("getExceptionType failed: " + t.getMessage()); }
-        return type[0];
+        return outType[0];
     }
 
     private static String extractBaseMessageSafe(Object descriptorObj, XValue xValue) {
@@ -1236,7 +1151,7 @@ public class DebugDataCollector {
                         });
                         rendered[0] = sb.toString();
                     }
-                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {
+                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String typeStr, @NotNull String value, boolean hasChildren) {
                         rendered[0] = value;
                     }
                     @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
