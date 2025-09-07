@@ -172,7 +172,13 @@ public class DebugDataCollector {
 
                 private void complete() {
                     List<SnapshotItem> result = new ArrayList<>();
-                    for (MutableSnapshotItem item : snapshotItems) result.add(item.toSnapshotItem());
+                    for (MutableSnapshotItem item : snapshotItems) {
+                        if (isPyCharmEnvironment()) {
+                            String pretty = prettyPrintPythonValue(item);
+                            if (pretty != null && !pretty.isEmpty()) item.value = pretty;
+                        }
+                        result.add(item.toSnapshotItem());
+                    }
                     instance.latestSnapshot.clear();
                     instance.latestSnapshot.addAll(result);
                     callback.accept(new ContextItem(result, true, ContextItem.Type.SNAPSHOT));
@@ -192,6 +198,42 @@ public class DebugDataCollector {
             instance.latestSnapshot.addAll(result);
             callback.accept(new ContextItem(result, false, ContextItem.Type.SNAPSHOT));
         }
+    }
+
+    /**
+     * Pretty print Python values as lists or dicts for readability.
+     */
+    private static String prettyPrintPythonValue(MutableSnapshotItem item) {
+        // Handle dict
+        if ("dict".equalsIgnoreCase(item.type)
+                || (item.value != null && item.value.startsWith("{") && item.value.endsWith("}"))) {
+            StringBuilder sb = new StringBuilder("{");
+            for (int i = 0; i < item.children.size(); i++) {
+                MutableSnapshotItem child = item.children.get(i);
+                sb.append(child.name).append(": ").append(prettyPrintPythonValue(child));
+                if (i < item.children.size() - 1) sb.append(", ");
+            }
+            sb.append("}");
+            return sb.toString();
+        }
+        // Handle list/tuple
+        if ("list".equalsIgnoreCase(item.type) || "tuple".equalsIgnoreCase(item.type)
+                || (item.value != null && item.value.startsWith("[") && item.value.endsWith("]"))) {
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < item.children.size(); i++) {
+                MutableSnapshotItem child = item.children.get(i);
+                sb.append(prettyPrintPythonValue(child));
+                if (i < item.children.size() - 1) sb.append(", ");
+            }
+            sb.append("]");
+            return sb.toString();
+        }
+        // Primitives
+        if (item.value != null && !"unavailable".equalsIgnoreCase(item.value)) {
+            return item.value;
+        }
+        // Fallback
+        return "";
     }
 
     /**
@@ -296,17 +338,35 @@ public class DebugDataCollector {
             frame.computeChildren(new XCompositeNode() {
                 @Override
                 public void addChildren(@NotNull XValueChildrenList children, boolean last) {
+                    boolean pyExceptionDetected = false;
                     for (int i = 0; i < children.size(); i++) {
                         String name = children.getName(i);
                         XValue value = children.getValue(i);
                         if (isPyCharmEnvironment() && "__exception__".equals(name)) {
+                            pyExceptionDetected = true;
                             processPyCharmExceptionTuple(value, frame, callback);
-                            return;
+                            break;
                         } else if (isExceptionCandidateSafe(name, value)) {
                             processExceptionSafe(value, frame, callback);
                             return;
                         }
                     }
+                    // If running in PyCharm, force exception detection from "__exception__" variable.
+                    if (isPyCharmEnvironment() && !pyExceptionDetected) {
+                        // Try to fallback: look for variable named "__exception__"
+                        try {
+                            for (int i = 0; i < children.size(); i++) {
+                                String name = children.getName(i);
+                                if ("__exception__".equals(name)) {
+                                    processPyCharmExceptionTuple(children.getValue(i), frame, callback);
+                                    return;
+                                }
+                            }
+                        } catch (Exception e) {
+                            logger.warn("Failed to fallback to __exception__ detection: " + e.getMessage());
+                        }
+                    }
+                    // fallback: nothing looked like exception -> collect snapshot
                     collectSnapshot(frame, callback);
                 }
                 @Override public void tooManyChildren(int remaining) {}
