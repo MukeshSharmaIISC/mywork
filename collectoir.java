@@ -16,11 +16,15 @@ import org.jetbrains.annotations.Nullable;
 import org.samsung.aipp.aippintellij.util.Constants;
 
 import javax.swing.*;
+import java.io.FileWriter;
+import java.io.PrintWriter;
 import java.lang.reflect.Method;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.Date;
 
 public class DebugDataCollector {
 
@@ -342,13 +346,14 @@ public class DebugDataCollector {
                                     } catch (Throwable e) {
                                         logger.debug("collectPyCharm: eval presentation parse failed: " + e.getMessage());
                                     } finally {
-                                        finishOnce.run();
+                                        // After this simple eval attempt, if still no value, try more aggressive evals and/or dump descriptor
+                                        postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                                     }
                                 }
                                 @Override
                                 public void errorOccurred(@NotNull String errorMessage) {
                                     logger.debug("collectPyCharm: evaluator error for '" + parent.name + "': " + errorMessage);
-                                    finishOnce.run();
+                                    postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                                 }
                             }, null);
                             return; // evaluation scheduled
@@ -357,8 +362,8 @@ public class DebugDataCollector {
                         logger.debug("collectPyCharm: evaluator attempt failed: " + e.getMessage());
                     }
 
-                    // Nothing else to do — finish
-                    finishOnce.run();
+                    // If we didn't do evaluator above, still attempt aggressive evals/dump before finishing
+                    postEvalAggressiveOrDump(frame, value, parent, finishOnce);
                 }
 
                 @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
@@ -369,6 +374,119 @@ public class DebugDataCollector {
             parent.value = "Value not available";
             finishOnce.run();
         }
+    }
+
+    /**
+     * After a basic eval/retrieval attempt, try multiple eval templates (aggressive attempts).
+     * If still no usable value, dump descriptor to file for inspection, then call finishOnce.
+     */
+    private static void postEvalAggressiveOrDump(XStackFrame frame, XValue value, MutableSnapshotItem parent, Runnable finishOnce) {
+        try {
+            if ((parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) && frame != null) {
+                List<String> templates = Arrays.asList(
+                        "%s",
+                        "str(%s)",
+                        "repr(%s)",
+                        "type(%s).__name__",
+                        "locals().get('%s', globals().get('%s', None))",
+                        "vars(%s) if hasattr(%s, '__dict__') else None"
+                );
+                evaluateExpressions(frame, parent.name != null ? parent.name : "", templates, parent, () -> {
+                    try {
+                        if (parent.value == null || parent.value.isEmpty() || "unavailable".equals(parent.value)) {
+                            Object desc = tryGetPyDebugValue(value);
+                            dumpDescriptorToFile(desc != null ? desc : value, parent.name != null ? parent.name : "unknown");
+                        }
+                    } catch (Throwable t) {
+                        logger.warn("postEvalAggressiveOrDump dump attempt failed: " + t.getMessage());
+                    } finally {
+                        finishOnce.run();
+                    }
+                });
+            } else {
+                finishOnce.run();
+            }
+        } catch (Throwable t) {
+            logger.warn("postEvalAggressiveOrDump failed: " + t.getMessage());
+            finishOnce.run();
+        }
+    }
+
+    /**
+     * Try multiple evaluator expressions in the frame until one yields a non-empty presentation.
+     * Calls onDone.run() when finished (whether successful or not).
+     */
+    private static void evaluateExpressions(XStackFrame frame, String varName, List<String> exprTemplates, MutableSnapshotItem parent, Runnable onDone) {
+        if (frame == null || frame.getEvaluator() == null || varName == null || varName.isEmpty()) {
+            onDone.run();
+            return;
+        }
+
+        // Build the concrete expressions by formatting templates with varName (escape as needed)
+        List<String> exprs = new ArrayList<>();
+        for (String tmpl : exprTemplates) {
+            try {
+                // use simple replace of %s placeholders to support templates with two placeholders
+                int count = tmpl.length() - tmpl.replace("%s", "").length();
+                if (count >= 2) {
+                    exprs.add(tmpl.replace("%s", varName));
+                } else {
+                    exprs.add(tmpl.replace("%s", varName));
+                }
+            } catch (Throwable t) {
+                // fallback: replace placeholder manually
+                exprs.add(tmpl.replace("%s", varName));
+            }
+        }
+
+        // recursive helper index-based
+        class Ctx {
+            void tryIndex(int idx) {
+                if (idx >= exprs.size()) { onDone.run(); return; }
+                String expr = exprs.get(idx);
+                logger.debug("evaluateExpressions: trying expr=" + expr + " for var=" + varName);
+                try {
+                    frame.getEvaluator().evaluate(expr, new XDebuggerEvaluator.XEvaluationCallback() {
+                        @Override
+                        public void evaluated(@NotNull XValue result) {
+                            try {
+                                result.computePresentation(new XValueNode() {
+                                    @Override
+                                    public void setPresentation(@Nullable Icon icon, @NotNull XValuePresentation presentation, boolean hasChildren) {
+                                        String val = renderPresentationText(presentation);
+                                        logger.debug("evaluateExpressions: eval result for expr=" + expr + " => '" + val + "'");
+                                        if (val != null && !val.isEmpty() && !"Collecting data...".equals(val)) {
+                                            parent.value = val;
+                                        }
+                                    }
+                                    @Override public void setFullValueEvaluator(@NotNull XFullValueEvaluator fullValueEvaluator) {}
+                                    @Override public void setPresentation(@Nullable Icon icon, @NotNull String type, @NotNull String value, boolean hasChildren) {}
+                                }, XValuePlace.TREE);
+                            } catch (Throwable e) {
+                                logger.debug("evaluateExpressions: eval presentation parse failed: " + e.getMessage());
+                            } finally {
+                                // If we got a value, finish, otherwise try next
+                                if (parent.value != null && !parent.value.isEmpty() && !"unavailable".equals(parent.value)) {
+                                    onDone.run();
+                                } else {
+                                    tryIndex(idx + 1);
+                                }
+                            }
+                        }
+
+                        @Override
+                        public void errorOccurred(@NotNull String errorMessage) {
+                            logger.debug("evaluateExpressions: eval error for expr=" + expr + " -> " + errorMessage);
+                            tryIndex(idx + 1);
+                        }
+                    }, null);
+                } catch (Throwable t) {
+                    logger.debug("evaluateExpressions: evaluator call failed for expr=" + expr + " -> " + t.getMessage());
+                    tryIndex(idx + 1);
+                }
+            }
+        }
+        new Ctx().tryIndex(0);
     }
 
     /**
@@ -510,6 +628,58 @@ public class DebugDataCollector {
             return type != null ? type.toString() : null;
         } catch (Throwable ignored) {}
         return "unknown";
+    }
+
+    /**
+     * Dump reflection info about a descriptor or object to a log file in the user's home directory.
+     * Useful when descriptors differ between PyCharm versions — this file will show available methods and some returns.
+     */
+    private static void dumpDescriptorToFile(Object desc, String varName) {
+        try {
+            String ts = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            String fname = System.getProperty("user.home") + "/aipp_debug_dump_" + ts + ".log";
+            try (PrintWriter pw = new PrintWriter(new FileWriter(fname, true))) {
+                pw.println("===== AIPP Debug Dump =====");
+                pw.println("Timestamp: " + new Date());
+                pw.println("VarName: " + varName);
+                if (desc == null) {
+                    pw.println("Descriptor: null");
+                } else {
+                    pw.println("Descriptor class: " + desc.getClass().getName());
+                    pw.println("Descriptor.toString():");
+                    try { pw.println(String.valueOf(desc.toString())); } catch (Throwable t) { pw.println("toString() failed: " + t.getMessage()); }
+                    pw.println("--- Methods (zero-arg) and sample returns ---");
+                    Method[] methods = desc.getClass().getMethods();
+                    for (Method m : methods) {
+                        if (m.getParameterCount() == 0) {
+                            String mname = m.getName();
+                            // skip noisy methods
+                            if (mname.equals("getClass")) continue;
+                            try {
+                                Object res = null;
+                                try { res = m.invoke(desc); } catch (Throwable it) { res = ("INVOCATION_FAILED: " + it.getMessage()); }
+                                if (res == null) {
+                                    pw.println(mname + " -> null");
+                                } else {
+                                    String rcls = res.getClass().getName();
+                                    String rstr = "";
+                                    try { rstr = String.valueOf(res.toString()); } catch (Throwable t) { rstr = "toString failed: " + t.getMessage(); }
+                                    // truncate long strings
+                                    if (rstr.length() > 1000) rstr = rstr.substring(0, 1000) + "...(truncated)";
+                                    pw.println(mname + " -> (" + rcls + ") " + rstr);
+                                }
+                            } catch (Throwable inv) {
+                                pw.println(mname + " -> invocation exception: " + inv.getMessage());
+                            }
+                        }
+                    }
+                }
+                pw.flush();
+            }
+            logger.warn("Descriptor dump written: " + fname);
+        } catch (Throwable t) {
+            logger.warn("dumpDescriptorToFile failed: " + t.getMessage());
+        }
     }
 
     /**
