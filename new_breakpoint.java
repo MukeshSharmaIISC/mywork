@@ -2,7 +2,6 @@ package org.dell..debugAssist;
 
 import com.intellij.codeInsight.completion.*;
 import com.intellij.codeInsight.lookup.LookupElementBuilder;
-import com.intellij.codeInsight.lookup.PrioritizedLookupElement;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
@@ -189,7 +188,20 @@ public class BreakpointCompletionProvider extends CompletionContributor {
                                         }
                                     });
 
-                            resultSet.addElement(PrioritizedLookupElement.withPriority(builder, 1000.0));
+                            try {
+                                // Try to use PrioritizedLookupElement if available (some platform SDK versions may not have it)
+                                Class<?> pleClass = Class.forName("com.intellij.codeInsight.lookup.PrioritizedLookupElement");
+                                java.lang.reflect.Method withPriority = pleClass.getMethod("withPriority", com.intellij.codeInsight.lookup.LookupElement.class, double.class);
+                                Object prioritized = withPriority.invoke(null, builder, 1000.0);
+                                if (prioritized instanceof com.intellij.codeInsight.lookup.LookupElement) {
+                                    resultSet.addElement((com.intellij.codeInsight.lookup.LookupElement) prioritized);
+                                } else {
+                                    resultSet.addElement(builder);
+                                }
+                            } catch (Throwable __t) {
+                                // PrioritizedLookupElement not available — add normal lookup element
+                                resultSet.addElement(builder);
+                            }
                         }
 
                     }
